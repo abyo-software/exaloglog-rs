@@ -34,6 +34,8 @@
 mod fast;
 mod math;
 mod packed;
+#[cfg(feature = "serde")]
+mod serde_impl;
 
 pub use fast::ExaLogLogFast;
 pub use packed::ExaLogLog;

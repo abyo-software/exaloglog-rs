@@ -6,6 +6,33 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-05-07
+
+### Added
+
+- **Sparse mode for `ExaLogLogFast`**, mirroring the design used in
+  `ExaLogLog`. New sketches start sparse; `new_dense(p)` skips straight
+  to dense storage. Auto-promotes at the per-variant break-even point.
+- `ExaLogLogFast::is_sparse()` and `ExaLogLogFast::densify()` exposed
+  for explicit control.
+- **Optional `serde` feature**. Behind `--features serde`, both
+  `ExaLogLog` and `ExaLogLogFast` implement `Serialize` and
+  `Deserialize`. The serde representation goes through the existing
+  `to_bytes` / `from_bytes` byte format, so JSON, MessagePack, bincode,
+  and CBOR all work without re-encoding.
+
+### Changed
+
+- `ExaLogLogFast::new(p)` now starts in sparse mode (was always dense).
+  Use `ExaLogLogFast::new_dense(p)` to preserve the previous behavior;
+  this is required for `add_hash_atomic` from a fresh sketch.
+- `ExaLogLogFast::add_hash_atomic` now panics if called while the
+  sketch is sparse, with a message pointing at `densify()` and
+  `new_dense()`. The lock-free atomic invariant requires the dense
+  storage layout.
+- `ExaLogLogFast::snapshot()` now materializes registers from tokens
+  in sparse mode rather than returning empty.
+
 ## [0.2.0] — 2026-05-06
 
 ### Added
