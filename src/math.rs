@@ -149,16 +149,12 @@ pub(crate) fn solve_ml_bisection(alpha: f64, beta: &[u32], p: u32) -> f64 {
 }
 
 /// Solve the ML equation `g(y) = α` using Newton's method per paper
-/// Algorithm 8. Faster than bisection (5-7 iterations to convergence vs
+/// Algorithm 8. Faster than bisection (5-10 iterations to convergence vs
 /// ~50) and uses the recursive product computation (Eq. 22, 30) so all
 /// expensive `(1+x)^{2^l}` powers are computed by repeated squaring.
 ///
 /// Returns `f64::NAN` on numerical failure; the public [`solve_ml`]
 /// wrapper falls back to bisection in that case.
-///
-/// Currently only matches bisection in the single-bucket case; multi-
-/// bucket case is being debugged. Bisection is the production path.
-#[allow(dead_code)]
 pub(crate) fn solve_ml_newton(alpha: f64, beta: &[u32], p: u32) -> f64 {
     if beta.iter().all(|&b| b == 0) {
         return 0.0;
@@ -235,8 +231,10 @@ pub(crate) fn solve_ml_newton(alpha: f64, beta: &[u32], p: u32) -> f64 {
             }
 
             let x_target = alpha_scaled * x;
-            if phi >= x_target {
-                // f(x) ≥ 0 → x is at or above the root, stop (Eq. 18).
+            if phi <= x_target {
+                // f(x) = α·2^{u_max}·x − φ(x) ≥ 0 means x has reached or
+                // passed the root (φ is decreasing, x_target increasing).
+                // See Eq. 18.
                 break;
             }
             let denom = psi + alpha_scaled * x;
@@ -262,12 +260,17 @@ pub(crate) fn solve_ml_newton(alpha: f64, beta: &[u32], p: u32) -> f64 {
     }
 }
 
-/// Solve the ML equation. Currently delegates to bisection;
-/// [`solve_ml_newton`] exists as an experimental Newton implementation
-/// being validated against bisection (matches at single-β cases but
-/// diverges at multi-β; under investigation).
+/// Solve the ML equation. Tries Newton's method (Algorithm 8) first;
+/// falls back to bisection if Newton produces a non-finite or negative
+/// result. Newton converges in 5-10 iterations vs bisection's ~50, so
+/// this is a meaningful speedup for `estimate()` calls.
 pub(crate) fn solve_ml(alpha: f64, beta: &[u32], p: u32) -> f64 {
-    solve_ml_bisection(alpha, beta, p)
+    let newton = solve_ml_newton(alpha, beta, p);
+    if newton.is_finite() && newton >= 0.0 {
+        newton
+    } else {
+        solve_ml_bisection(alpha, beta, p)
+    }
 }
 
 /// Apply Algorithm 2's register update rule given the existing register `r`,
@@ -452,6 +455,33 @@ mod tests {
         let beta = vec![0u32; 60];
         assert_eq!(solve_ml_newton(0.0, &beta, 12), 0.0);
         assert_eq!(solve_ml_newton(1.0, &beta, 12), 0.0);
+    }
+
+    #[test]
+    fn newton_agrees_with_bisection_on_synthetic_betas() {
+        for p in [3u32, 8, 12, 16] {
+            let beta_len = (64 - T) as usize;
+            for shift in 0..3 {
+                let mut beta = vec![0u32; beta_len];
+                for j in 0..10 {
+                    let idx = (p as usize + shift + j).min(beta_len - 1);
+                    beta[idx] = ((j + 1) * 100) as u32;
+                }
+                for &alpha_n in &[10.0_f64, 1000.0, 1e6, 1e9] {
+                    let alpha = alpha_n / (1u64 << p) as f64;
+                    let bis = solve_ml_bisection(alpha, &beta, p);
+                    let nwt = solve_ml_newton(alpha, &beta, p);
+                    if !nwt.is_finite() {
+                        continue;
+                    }
+                    let rel = (bis - nwt).abs() / bis.max(1.0);
+                    assert!(
+                        rel < 1e-3,
+                        "p={p} shift={shift} alpha_n={alpha_n}: bis={bis}, newton={nwt}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

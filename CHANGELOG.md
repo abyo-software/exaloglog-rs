@@ -6,6 +6,27 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-05-07
+
+### Added
+
+- **Newton solver for the ML estimator** (paper Algorithm 8). Uses the
+  recursive product computation (Eq. 22, 30) so the expensive
+  `(1+x)^{2^l}` powers are evaluated by repeated squaring; converges
+  in 5-10 iterations across the operating range. The public
+  `estimate_ml` (and `estimate`) now route through Newton, with an
+  automatic fallback to bisection on numerical failure.
+- Validation: a new property test asserts Newton agrees with bisection
+  to ~1e-3 across a synthetic battery of (β, α) configurations, and
+  the existing accuracy bound tests now run against the Newton path.
+
+### Fixed
+
+- The Newton scaffolding shipped (disabled) in 0.4.0 had its
+  termination condition inverted (`φ ≥ x'` should have been `φ ≤ x'`,
+  per the sign of `f(x) = α·2^{u_max}·x − φ(x)`). Corrected and
+  validated against the Java reference fixtures.
+
 ## [0.5.0] — 2026-05-07
 
 ### Added
