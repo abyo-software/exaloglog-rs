@@ -208,23 +208,85 @@ impl ExaLogLog {
 
     /// Best available cardinality estimate.
     ///
-    /// In v0 this is the martingale (HIP) estimator. After a merge the running
-    /// state is invalidated and this returns `f64::NAN` until a maximum-
-    /// likelihood estimator is implemented in a follow-up commit.
+    /// Uses the maximum-likelihood estimator (Algorithm 3 + log-likelihood
+    /// Eq. 15), which works from the register state alone and so is valid
+    /// after merges and deserialization.
     pub fn estimate(&self) -> f64 {
-        self.estimate_martingale().unwrap_or(f64::NAN)
+        self.estimate_ml()
+    }
+
+    /// Maximum-likelihood estimate of the cardinality.
+    ///
+    /// Computes the coefficients `α` and `β_u` per Algorithm 3, then solves
+    /// the ML equation `g(y) = α` by bisection in `log₂(y)` where `y = n/m`
+    /// and `g(y) = Σ β_u / (2^u · (exp(y/2^u) − 1))`. The dedicated Newton's-
+    /// method solver from Algorithm 8 is planned but bisection already
+    /// converges to f64 precision.
+    pub fn estimate_ml(&self) -> f64 {
+        let (alpha, beta) = self.compute_alpha_beta();
+        solve_ml(alpha, &beta, self.p)
     }
 
     /// Martingale (HIP) estimate, if the running state is still valid.
     ///
-    /// Returns `None` after a merge or any operation that does not preserve
-    /// the incremental state.
+    /// Returns `None` after a merge or any operation that breaks the
+    /// incremental state. Has slightly lower variance than ML on freshly
+    /// built sketches; the paper reports up to 33% smaller MVP than HLL.
     pub fn estimate_martingale(&self) -> Option<f64> {
         if self.martingale_invalid {
             None
         } else {
             Some(self.martingale)
         }
+    }
+
+    /// Compute α and β_u coefficients of the log-likelihood (Algorithm 3).
+    ///
+    /// Returns α already divided by `2^(64-p)`. Per register `i` with
+    /// max-update-value `u_i` and bitmap `l_1...l_d`:
+    ///
+    /// - α gets `ω(u_i)` for the "no update values > u_i seen" event.
+    /// - α gets `1/2^φ(k)` for each `k ∈ [max(1, u_i - d), u_i - 1]` whose
+    ///   bitmap bit is clear (that update value has not been hit).
+    /// - β bucket `φ(u_i)` is incremented for the "u_i was the max" event.
+    /// - β bucket `φ(k)` is incremented for each `k ∈ [max(1, u_i - d),
+    ///   u_i - 1]` whose bitmap bit is set (k has been hit).
+    ///
+    /// `β` is indexed `0..(64 - p - t)` where entry `j` is the paper's
+    /// `β_{j + t + 1}`.
+    fn compute_alpha_beta(&self) -> (f64, Vec<u32>) {
+        let p = self.p;
+        let beta_len = (64 - p - T) as usize;
+        let mut beta = vec![0u32; beta_len];
+        let mut alpha = 0.0_f64;
+
+        for &r in self.registers.iter() {
+            let u = r >> D;
+            let bitmap = r & D_MASK;
+
+            alpha += omega(u, p);
+
+            if u >= 1 {
+                let j = phi(u, p);
+                beta[(j - T - 1) as usize] += 1;
+
+                if u >= 2 {
+                    let k_lo = u.saturating_sub(D).max(1);
+                    for k in k_lo..u {
+                        let bit_pos = D - (u - k);
+                        let bit_set = (bitmap >> bit_pos) & 1 == 1;
+                        let phi_k = phi(k, p);
+                        if bit_set {
+                            beta[(phi_k - T - 1) as usize] += 1;
+                        } else {
+                            alpha += pow2_neg(phi_k);
+                        }
+                    }
+                }
+            }
+        }
+
+        (alpha, beta)
     }
 
     /// Merge another sketch into `self` (Algorithm 5).
@@ -302,6 +364,70 @@ fn h(r: u32, p: u32) -> f64 {
 #[inline]
 fn pow2_neg(x: u32) -> f64 {
     f64::from_bits((1023u64.wrapping_sub(x as u64)) << 52)
+}
+
+/// `g(y) = Σ_u β_u / (2^u · (exp(y/2^u) − 1))` — left-hand side of the ML
+/// equation `g(y) = α` (derivative of Eq. 15 set to zero).
+///
+/// Monotonically decreasing in `y` from `+∞` (as `y → 0⁺`) to `0`
+/// (as `y → ∞`), so the equation has at most one root in `(0, ∞)`.
+fn g(y: f64, beta: &[u32]) -> f64 {
+    let mut sum = 0.0;
+    for (idx, &b) in beta.iter().enumerate() {
+        if b == 0 {
+            continue;
+        }
+        let u = idx as u32 + T + 1;
+        let scale = pow2_neg(u);
+        let denom = (y * scale).exp_m1();
+        if !denom.is_finite() || denom == 0.0 {
+            // For huge y/2^u, exp_m1 → +inf and the term → 0. For very tiny y
+            // (denom underflowed to 0), the term is effectively +∞, but we
+            // bracket the search to keep y away from that regime.
+            continue;
+        }
+        sum += b as f64 * scale / denom;
+    }
+    sum
+}
+
+/// Solve the ML equation `g(y) = α` for `y = n/m` by bisection in `log₂(y)`.
+///
+/// Returns the cardinality estimate `n = m · y`. Returns `0.0` for an empty
+/// sketch (all `β_u` zero).
+fn solve_ml(alpha: f64, beta: &[u32], p: u32) -> f64 {
+    if beta.iter().all(|&b| b == 0) {
+        return 0.0;
+    }
+    if alpha <= 0.0 {
+        return f64::INFINITY;
+    }
+
+    // log₂(y) bracket. Wide enough for any practical cardinality and within
+    // the safe range for f64 exponentiation. The actual ML root lies in
+    // [-log₂(m), log₂(2^64)] in practical use; we bracket much wider for
+    // safety and let bisection converge.
+    let mut lo: f64 = -200.0;
+    let mut hi: f64 = 200.0;
+
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        let y = (mid * std::f64::consts::LN_2).exp();
+        let gv = g(y, beta);
+        if gv > alpha {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if hi - lo < 1e-13 {
+            break;
+        }
+    }
+
+    let mid = 0.5 * (lo + hi);
+    let y = (mid * std::f64::consts::LN_2).exp();
+    let m = (1u64 << p) as f64;
+    m * y
 }
 
 /// Merge two register values from sketches with the same `t, d, p`
@@ -417,9 +543,6 @@ mod tests {
 
     #[test]
     fn merge_of_disjoint_sets_estimates_union() {
-        // After merging, the running martingale state is invalidated and
-        // estimate() returns NaN. We verify the register state is the same as
-        // a single sketch built from the union.
         let p = 12;
         let mut a = ExaLogLog::new(p);
         let mut b = ExaLogLog::new(p);
@@ -436,12 +559,69 @@ mod tests {
 
         a.merge(&b).unwrap();
 
-        // After merge: martingale is invalid → estimate() is NaN.
-        assert!(a.estimate().is_nan());
+        // Martingale state is invalidated by merge.
         assert_eq!(a.estimate_martingale(), None);
 
-        // But the register state should match `combined` exactly.
+        // Register state must match a single sketch of the union.
         assert_eq!(a.registers(), combined.registers());
+
+        // The ML estimator works from registers alone and recovers a good
+        // estimate of the union cardinality.
+        let est = a.estimate();
+        let rel_err = (est - 100_000.0).abs() / 100_000.0;
+        assert!(
+            rel_err < 0.05,
+            "post-merge ML estimate = {est}, rel_err = {rel_err}"
+        );
+    }
+
+    #[test]
+    fn ml_estimate_within_error_bounds() {
+        // ML works from register state alone; verify it across a few
+        // cardinalities. Theoretical RMSE for ELL(2, 24) at p=12 is
+        // sqrt(MVP / total_bits) = sqrt(3.78 / (32 · 4096)) ≈ 0.54%.
+        // Allow 5% headroom from a single random sample.
+        let p = 12;
+        for &n in &[100u64, 1_000, 10_000, 100_000, 1_000_000] {
+            let mut s = ExaLogLog::new(p);
+            for i in 0..n {
+                s.add_hash(splitmix64(i));
+            }
+            let est = s.estimate_ml();
+            let rel_err = (est - n as f64).abs() / n as f64;
+            assert!(
+                rel_err < 0.05,
+                "ML at n={n}: est={est}, rel_err={rel_err}"
+            );
+        }
+    }
+
+    #[test]
+    fn ml_and_martingale_agree_on_fresh_sketch() {
+        // Both estimators should give similar values on a sketch built by
+        // streaming inserts (no merge). They use different statistics and
+        // both target the true cardinality.
+        let p = 12;
+        let n = 50_000u64;
+        let mut s = ExaLogLog::new(p);
+        for i in 0..n {
+            s.add_hash(splitmix64(i));
+        }
+        let mart = s.estimate_martingale().unwrap();
+        let ml = s.estimate_ml();
+        let rel_diff = (mart - ml).abs() / n as f64;
+        assert!(
+            rel_diff < 0.02,
+            "ML vs martingale disagree: ml={ml}, mart={mart}"
+        );
+    }
+
+    #[test]
+    fn ml_estimate_zero_on_empty_sketch() {
+        for p in [3u32, 8, 12, 18] {
+            let s = ExaLogLog::new(p);
+            assert_eq!(s.estimate_ml(), 0.0);
+        }
     }
 
     #[test]
