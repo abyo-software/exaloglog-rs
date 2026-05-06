@@ -303,6 +303,43 @@ impl ExaLogLogFast {
         }
     }
 
+    /// Cache-locality-optimized batch insert. See the corresponding
+    /// method on [`crate::ExaLogLog::add_hashes_sorted`] for the design
+    /// rationale.
+    pub fn add_hashes_sorted(&mut self, hashes: &[u64]) {
+        if hashes.is_empty() {
+            return;
+        }
+        self.densify();
+        let p = self.p;
+        let regs = match &self.storage {
+            FastStorage::Dense(r) => r,
+            FastStorage::Sparse(_) => unreachable!(),
+        };
+        let mut iks: Vec<(u32, u32)> = hashes
+            .iter()
+            .map(|&h| {
+                let (i, k) = math::hash_to_register_k(h, p);
+                (i as u32, k)
+            })
+            .collect();
+        iks.sort_unstable();
+        let mut idx = 0;
+        while idx < iks.len() {
+            let i = iks[idx].0 as usize;
+            let r_start = regs[i].load(Ordering::Relaxed);
+            let mut r = r_start;
+            while idx < iks.len() && iks[idx].0 as usize == i {
+                r = math::apply_insert(r, iks[idx].1, D);
+                idx += 1;
+            }
+            if r != r_start {
+                regs[i].store(r, Ordering::Relaxed);
+            }
+        }
+        self.martingale_invalid = true;
+    }
+
     /// Insert any hashable value, using the standard library default hasher.
     /// For high-throughput workloads, prefer [`Self::add_hash`] with a
     /// faster hash function.
@@ -419,6 +456,18 @@ impl ExaLogLogFast {
                 self.martingale = f64::NAN;
                 self.mu = f64::NAN;
             }
+        }
+        Ok(())
+    }
+
+    /// Merge an iterator of sketches into `self` (Algorithm 5 applied
+    /// repeatedly).
+    pub fn merge_iter<'a, I>(&mut self, sketches: I) -> Result<(), MergeError>
+    where
+        I: IntoIterator<Item = &'a Self>,
+    {
+        for s in sketches {
+            self.merge(s)?;
         }
         Ok(())
     }
@@ -879,6 +928,42 @@ mod tests {
         }
         batched.add_hashes(&hashes);
         assert_eq!(serial.snapshot(), batched.snapshot());
+    }
+
+    #[test]
+    fn add_hashes_sorted_matches_serial() {
+        let p = 12;
+        let n = 100_000u64;
+        let mut serial = ExaLogLogFast::new_dense(p);
+        let mut sorted = ExaLogLogFast::new_dense(p);
+        let hashes: Vec<u64> = (0..n).map(splitmix64).collect();
+        for &h in &hashes {
+            serial.add_hash(h);
+        }
+        sorted.add_hashes_sorted(&hashes);
+        assert_eq!(serial.snapshot(), sorted.snapshot());
+    }
+
+    #[test]
+    fn merge_iter_matches_repeated_merge() {
+        let p = 10;
+        let mut targets: Vec<ExaLogLogFast> = (0..5)
+            .map(|tid| {
+                let mut s = ExaLogLogFast::new_dense(p);
+                for i in (tid * 1000)..((tid + 1) * 1000) {
+                    s.add_hash(splitmix64(i));
+                }
+                s
+            })
+            .collect();
+        let head = targets.remove(0);
+        let mut a = head.clone();
+        for s in &targets {
+            a.merge(s).unwrap();
+        }
+        let mut b = head;
+        b.merge_iter(targets.iter()).unwrap();
+        assert_eq!(a.snapshot(), b.snapshot());
     }
 
     #[test]

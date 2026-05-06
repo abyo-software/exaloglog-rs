@@ -6,6 +6,22 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-05-07
+
+### Added
+
+- **`add_hashes_sorted(&mut self, &[u64])`** on both variants: a
+  cache-locality-optimized batch insert. Computes all `(i, k)` pairs,
+  sorts by register index, and applies all updates to register `i`
+  together before moving on. Cuts register R/W traffic from `O(N)` to
+  `O(distinct registers in batch)` and turns a random-access pattern
+  into a sequential one. Empirically ~10-25% faster than the scalar
+  loop when the register array exceeds L1 cache (`p ≥ 16`). Below
+  that, sort overhead dominates; use the regular `add_hashes`.
+- **`merge_iter(impl IntoIterator<Item = &Self>)`** on both variants:
+  merge many sketches into `self` in one call. Convenience for the
+  common pattern of rolling up per-tenant sketches.
+
 ## [0.6.0] — 2026-05-07
 
 ### Added

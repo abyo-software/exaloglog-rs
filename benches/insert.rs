@@ -56,5 +56,47 @@ fn bench_estimate(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_insert, bench_estimate);
+fn bench_sorted_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch_insert");
+    let n = 1_000_000u64;
+    group.throughput(Throughput::Elements(n));
+    let hashes: Vec<u64> = (0..n).map(splitmix64).collect();
+    for p in [12u32, 16] {
+        group.bench_function(format!("packed_loop_p{p}"), |b| {
+            b.iter(|| {
+                let mut s = ExaLogLog::new_dense(p);
+                for &h in &hashes {
+                    s.add_hash(h);
+                }
+                black_box(s)
+            });
+        });
+        group.bench_function(format!("packed_sorted_p{p}"), |b| {
+            b.iter(|| {
+                let mut s = ExaLogLog::new_dense(p);
+                s.add_hashes_sorted(&hashes);
+                black_box(s)
+            });
+        });
+        group.bench_function(format!("fast_loop_p{p}"), |b| {
+            b.iter(|| {
+                let mut s = ExaLogLogFast::new_dense(p);
+                for &h in &hashes {
+                    s.add_hash(h);
+                }
+                black_box(s)
+            });
+        });
+        group.bench_function(format!("fast_sorted_p{p}"), |b| {
+            b.iter(|| {
+                let mut s = ExaLogLogFast::new_dense(p);
+                s.add_hashes_sorted(&hashes);
+                black_box(s)
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_insert, bench_estimate, bench_sorted_batch);
 criterion_main!(benches);
