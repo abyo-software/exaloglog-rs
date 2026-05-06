@@ -1,6 +1,6 @@
 //! Insertion and estimation throughput micro-benchmarks for both variants.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use exaloglog::{ExaLogLog, ExaLogLogFast};
 
 fn splitmix64(mut x: u64) -> u64 {

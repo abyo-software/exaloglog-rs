@@ -126,10 +126,9 @@ impl std::fmt::Display for DeserializeError {
             DeserializeError::InvalidPrecision(p) => {
                 write!(f, "invalid precision p={p} (allowed: {MIN_P}..={MAX_P})")
             }
-            DeserializeError::LengthMismatch { got, expected } => write!(
-                f,
-                "length mismatch: got {got} bytes, expected {expected}"
-            ),
+            DeserializeError::LengthMismatch { got, expected } => {
+                write!(f, "length mismatch: got {got} bytes, expected {expected}")
+            }
         }
     }
 }

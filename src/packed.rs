@@ -14,7 +14,7 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use crate::math;
-use crate::{DeserializeError, MergeError, FORMAT_VERSION, MAGIC};
+use crate::{DeserializeError, FORMAT_VERSION, MAGIC, MergeError};
 use crate::{MAX_P, MIN_P, T};
 
 const D: u32 = 20;
@@ -102,7 +102,10 @@ impl ExaLogLog {
     #[inline]
     fn set_register(&mut self, i: usize, value: u32) {
         debug_assert!(i < self.num_registers());
-        debug_assert!(value <= REGISTER_MASK, "register value {value:#x} exceeds 28 bits");
+        debug_assert!(
+            value <= REGISTER_MASK,
+            "register value {value:#x} exceeds 28 bits"
+        );
         let chunk_off = (i >> 1) * BYTES_PER_PAIR;
         let v = value & REGISTER_MASK;
         if i & 1 == 0 {

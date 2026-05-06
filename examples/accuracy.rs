@@ -12,18 +12,16 @@
 //! ```
 
 use exaloglog::{ExaLogLog, ExaLogLogFast};
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::Rng;
 
 fn main() {
     let cardinalities = [100u64, 1_000, 10_000, 100_000, 1_000_000];
     let precisions = [8u32, 10, 12, 14];
     let trials = 200;
 
-    println!(
-        "ExaLogLog accuracy — {trials} trials per row, ML and martingale (HIP) estimators\n"
-    );
+    println!("ExaLogLog accuracy — {trials} trials per row, ML and martingale (HIP) estimators\n");
 
     println!("=== ExaLogLog (packed, t=2, d=20, MVP=3.67) ===");
     print_header();
@@ -58,7 +56,10 @@ fn main() {
     let mvp_hll6 = 6.48;
     let mvp_packed = 3.67;
     let mvp_fast = 3.78;
-    println!("{:<6} {:>12} {:>12} {:>12} {:>12}", "p", "ELL_bytes", "HLL_for_same", "saving_%", "fast_bytes");
+    println!(
+        "{:<6} {:>12} {:>12} {:>12} {:>12}",
+        "p", "ELL_bytes", "HLL_for_same", "saving_%", "fast_bytes"
+    );
     for &p in &precisions {
         let m = 1u64 << p;
         let packed_bytes = (m as f64 * 7.0 / 2.0) as u64;

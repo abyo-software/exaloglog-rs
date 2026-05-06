@@ -243,9 +243,7 @@ mod tests {
         for x in 0u32..64 {
             let fast = pow2_neg(x);
             let reference = 2.0_f64.powi(-(x as i32));
-            assert!(
-                (fast - reference).abs() < 1e-300 || (fast / reference - 1.0).abs() < 1e-15,
-            );
+            assert!((fast - reference).abs() < 1e-300 || (fast / reference - 1.0).abs() < 1e-15,);
         }
         let _ = MAX_P;
     }

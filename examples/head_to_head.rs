@@ -23,7 +23,7 @@
 //! ```
 
 use exaloglog::ExaLogLog;
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 const TRIALS: usize = 200;
 const N: u64 = 1_000_000;
@@ -44,7 +44,7 @@ fn main() {
     for p in [8u32, 10, 12, 14] {
         let m = 1u64 << p;
         let ell_bytes = ((m as usize) * 7) / 2; // 28 bits per register, packed
-        let hll6_bytes = ((m as usize * 6) + 7) / 8; // 6 bits packed
+        let hll6_bytes = (m as usize * 6).div_ceil(8); // 6 bits packed
         let hll8_bytes = m as usize; // 8 bits per register
 
         let ell_rmse = run_ell(p);
@@ -75,15 +75,13 @@ fn main() {
 
     for target_pct in [2.0_f64, 1.5, 1.0, 0.7, 0.5] {
         let target = target_pct / 100.0;
-        let (ell_p, ell_b) = smallest_meeting(target, |p| run_ell(p), |p| {
-            (((1u64 << p) as usize) * 7) / 2
-        });
-        let (_, hll6_b) = smallest_meeting(target, |p| run_hll(p, HllReg::Bits6), |p| {
-            ((1usize << p) * 6 + 7) / 8
-        });
-        let (_, hll8_b) = smallest_meeting(target, |p| run_hll(p, HllReg::Bits8), |p| {
-            1usize << p
-        });
+        let (ell_p, ell_b) = smallest_meeting(target, run_ell, |p| (((1u64 << p) as usize) * 7) / 2);
+        let (_, hll6_b) = smallest_meeting(
+            target,
+            |p| run_hll(p, HllReg::Bits6),
+            |p| ((1usize << p) * 6).div_ceil(8),
+        );
+        let (_, hll8_b) = smallest_meeting(target, |p| run_hll(p, HllReg::Bits8), |p| 1usize << p);
         let saving = 100.0 * (1.0 - ell_b as f64 / hll6_b as f64);
         println!(
             "{:<9.2}% {:>8} {:>10} {:>10} {:>10} {:>15.1}%",

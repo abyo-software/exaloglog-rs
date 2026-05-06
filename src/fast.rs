@@ -16,7 +16,7 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use crate::math;
-use crate::{DeserializeError, MergeError, FORMAT_VERSION, MAGIC};
+use crate::{DeserializeError, FORMAT_VERSION, MAGIC, MergeError};
 use crate::{MAX_P, MIN_P, T};
 
 const D: u32 = 24;
@@ -248,9 +248,7 @@ mod tests {
         for i in 0..200_000u64 {
             let r_before = s.registers().to_vec();
             s.add_hash(splitmix64(i));
-            for (j, (&old_r, &new_r)) in
-                r_before.iter().zip(s.registers().iter()).enumerate()
-            {
+            for (j, (&old_r, &new_r)) in r_before.iter().zip(s.registers().iter()).enumerate() {
                 if old_r != new_r {
                     let h_old = h(old_r, p, D);
                     let h_new = h(new_r, p, D);
