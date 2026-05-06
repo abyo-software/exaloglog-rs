@@ -194,6 +194,64 @@ impl ExaLogLog {
         Ok(())
     }
 
+    /// Reduce this sketch's precision to `new_p ≤ self.precision()`,
+    /// returning a new sketch. Lossless: the result equals what you would
+    /// get by directly inserting the same elements into a sketch with
+    /// `new_p`. Implements Algorithm 6 of the paper, restricted to the
+    /// case where `d` stays the same.
+    pub fn reduce(&self, new_p: u32) -> Self {
+        assert!(
+            (MIN_P..=MAX_P).contains(&new_p) && new_p <= self.p,
+            "new_p={new_p} must be in [{MIN_P}, {self_p}]",
+            self_p = self.p
+        );
+        let mut out = Self::new(new_p);
+        if new_p == self.p {
+            for i in 0..self.num_registers() {
+                out.set_register(i, self.get_register(i));
+            }
+            out.martingale_invalid = true;
+            return out;
+        }
+        let p_diff = self.p - new_p;
+        let m_new = 1usize << new_p;
+        let two_t = 1u32 << T;
+        let a = (64 - T - self.p) * two_t + 1;
+
+        for new_i in 0..m_new {
+            let mut acc = 0u32;
+            for j in 0..(1u64 << p_diff) {
+                let old_i = new_i + m_new * j as usize;
+                let mut r = self.get_register(old_i);
+                let u = r >> D;
+
+                if u >= a {
+                    let bit_len_j = if j == 0 {
+                        0
+                    } else {
+                        64 - j.leading_zeros()
+                    };
+                    let s = (p_diff - bit_len_j) * two_t;
+                    if s > 0 {
+                        let v = D + a - u;
+                        if v > 0 {
+                            let high = (r >> v) << v;
+                            let low_v = r & ((1u32 << v) - 1);
+                            let low_v_shifted = low_v >> s;
+                            r = high | low_v_shifted;
+                        }
+                        r += s << D;
+                    }
+                }
+
+                acc = math::merge_register(acc, r, D);
+            }
+            out.set_register(new_i, acc & REGISTER_MASK);
+        }
+        out.martingale_invalid = true;
+        out
+    }
+
     /// Reset to empty.
     pub fn clear(&mut self) {
         for b in self.storage.iter_mut() {
@@ -419,6 +477,38 @@ mod tests {
             assert_eq!(restored.get_register(i), s.get_register(i));
         }
         assert!((restored.estimate_ml() - est).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reduce_to_same_p_returns_same_state() {
+        let p = 10;
+        let mut s = ExaLogLog::new(p);
+        for i in 0..10_000u64 {
+            s.add_hash(splitmix64(i));
+        }
+        let r = s.reduce(p);
+        for i in 0..s.num_registers() {
+            assert_eq!(r.get_register(i), s.get_register(i));
+        }
+    }
+
+    #[test]
+    fn reduce_preserves_estimate_within_tolerance() {
+        let p_high = 12;
+        let p_low = 10;
+        let n = 50_000u64;
+        let mut a = ExaLogLog::new(p_high);
+        let mut direct = ExaLogLog::new(p_low);
+        for i in 0..n {
+            let h = splitmix64(i);
+            a.add_hash(h);
+            direct.add_hash(h);
+        }
+        let reduced = a.reduce(p_low);
+        let red_est = reduced.estimate_ml();
+        let dir_est = direct.estimate_ml();
+        let rel_diff = (red_est - dir_est).abs() / n as f64;
+        assert!(rel_diff < 0.10, "reduced={red_est}, direct={dir_est}");
     }
 
     #[test]
