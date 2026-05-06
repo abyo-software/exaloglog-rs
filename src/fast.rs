@@ -153,12 +153,7 @@ impl ExaLogLogFast {
             if current == new_r {
                 return;
             }
-            match reg.compare_exchange_weak(
-                current,
-                new_r,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match reg.compare_exchange_weak(current, new_r, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => return,
                 Err(observed) => {
                     current = observed;
@@ -255,11 +250,7 @@ impl ExaLogLogFast {
                     // exposed to the leading-zero count, are encoded in j.
                     // s = (p_diff - bit_length(j)) · 2^t  is how many
                     // extra "levels" u gains in the new sketch.
-                    let bit_len_j = if j == 0 {
-                        0
-                    } else {
-                        64 - j.leading_zeros()
-                    };
+                    let bit_len_j = if j == 0 { 0 } else { 64 - j.leading_zeros() };
                     let s = (p_diff - bit_len_j) * two_t;
                     if s > 0 {
                         let v = D + a - u;

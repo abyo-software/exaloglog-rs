@@ -27,7 +27,7 @@ fn main() {
     print_header();
     for &p in &precisions {
         for &n in &cardinalities {
-            let s = ExaLogLog::new(p);
+            let s = ExaLogLog::new_dense(p);
             let bytes = s.register_bytes();
             drop(s);
             let stats = run_packed(p, n, trials);
@@ -108,25 +108,34 @@ fn print_row(p: u32, n: u64, bytes: usize, s: Stats) {
 fn run_packed(p: u32, n: u64, trials: usize) -> Stats {
     let mut ml_sq = 0.0;
     let mut hip_sq = 0.0;
+    let mut hip_count = 0;
     let mut ml_sum = 0.0;
     for trial in 0..trials {
         let mut rng = StdRng::seed_from_u64(0xCAFE_BABE_0000_0000 ^ trial as u64);
-        let mut s = ExaLogLog::new(p);
+        // Skip sparse mode for the bench: it would auto-promote at break-even
+        // anyway and we want to compare apples-to-apples register-storage RMSE.
+        let mut s = ExaLogLog::new_dense(p);
         for _ in 0..n {
             let h: u64 = rng.r#gen();
             s.add_hash(h);
         }
         let ml = s.estimate_ml();
-        let hip = s.estimate_martingale().expect("HIP valid for fresh sketch");
         let ml_err = (ml - n as f64) / n as f64;
-        let hip_err = (hip - n as f64) / n as f64;
         ml_sq += ml_err * ml_err;
-        hip_sq += hip_err * hip_err;
         ml_sum += ml_err;
+        if let Some(hip) = s.estimate_martingale() {
+            let hip_err = (hip - n as f64) / n as f64;
+            hip_sq += hip_err * hip_err;
+            hip_count += 1;
+        }
     }
     Stats {
         ml_rmse: (ml_sq / trials as f64).sqrt(),
-        hip_rmse: (hip_sq / trials as f64).sqrt(),
+        hip_rmse: if hip_count > 0 {
+            (hip_sq / hip_count as f64).sqrt()
+        } else {
+            f64::NAN
+        },
         ml_bias: ml_sum / trials as f64,
     }
 }

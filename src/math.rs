@@ -214,6 +214,81 @@ pub(crate) fn hash_to_register_k(hash: u64, p: u32) -> (usize, u32) {
     (i, k)
 }
 
+/// Hash-token compression for sparse mode (Section 4.3, Eq. v + 6 bits).
+///
+/// Maps a 64-bit hash to a 32-bit token: the high 26 bits store the hash's
+/// low 26 bits, and the low 6 bits store `nlz(hash | (2^26 − 1))` — the
+/// number of leading zeros of the hash's high 38 bits.
+///
+/// `V = 26` is chosen so `p + t ≤ V` holds for any `p ≤ MAX_P = 26` with
+/// `t = 2`, ensuring the token preserves enough information to lossy-
+/// reconstruct a representative hash for any sketch in this crate.
+pub(crate) const SPARSE_V: u32 = 26;
+const SPARSE_NLZ_BITS: u32 = 6;
+const SPARSE_NLZ_MASK: u32 = (1 << SPARSE_NLZ_BITS) - 1;
+
+/// Hash → 32-bit token.
+#[inline]
+pub(crate) fn hash_to_token(hash: u64) -> u32 {
+    let low_v = (hash & ((1u64 << SPARSE_V) - 1)) as u32;
+    let masked = hash | ((1u64 << SPARSE_V) - 1);
+    let nlz = masked.leading_zeros().min(64 - SPARSE_V);
+    (low_v << SPARSE_NLZ_BITS) | (nlz & SPARSE_NLZ_MASK)
+}
+
+/// Token → representative 64-bit hash. The reconstruction is faithful
+/// for all bits that any ELL sketch with `p + t ≤ V` could observe.
+#[inline]
+pub(crate) fn token_to_hash(token: u32) -> u64 {
+    let low_v = (token >> SPARSE_NLZ_BITS) as u64;
+    let nlz = token & SPARSE_NLZ_MASK;
+    let high_bit: u64 = if nlz < 64 - SPARSE_V {
+        1u64 << (63 - nlz)
+    } else {
+        0
+    };
+    high_bit | low_v
+}
+
+/// ML estimate of distinct count from a set of distinct hash tokens
+/// (sparse mode, paper §4.3 Eq. 26). The tokens must be deduplicated.
+///
+/// The log-likelihood has the same shape as the dense Eq. 15 with `m = 1`
+/// and `t = V`, so we reuse [`solve_ml`] by re-indexing the sparse β
+/// vector into its dense layout.
+pub(crate) fn estimate_from_tokens(tokens: &[u32]) -> f64 {
+    if tokens.is_empty() {
+        return 0.0;
+    }
+
+    // Sparse PMF: ρ_token(w) = 2^(-u_w) where u_w = min(V + 1 + nlz(w), 64).
+    // α (sparse) = 1 − Σ ρ_token(w) summed over w ∈ T  (Eq. 25 + 26).
+    // β_u (sparse) = number of tokens at PMF index u, for u ∈ [V+1, 64].
+    let mut alpha = 1.0_f64;
+    let beta_len_sparse = (64 - SPARSE_V) as usize; // u ∈ [V+1, 64]
+    let mut sparse_beta = vec![0u32; beta_len_sparse];
+
+    for &w in tokens {
+        let nlz = w & SPARSE_NLZ_MASK;
+        let u = (SPARSE_V + 1 + nlz).min(64);
+        sparse_beta[(u - SPARSE_V - 1) as usize] += 1;
+        alpha -= pow2_neg(u);
+    }
+
+    // solve_ml expects β indexed by (u − T − 1) for u ∈ [T+1, 64].
+    // Sparse β index 0 corresponds to u = V + 1; in solve_ml's index that is
+    // V − T (since solve_ml index = u − T − 1).
+    let solve_beta_len = (64 - T) as usize;
+    let mut solve_beta = vec![0u32; solve_beta_len];
+    let offset = (SPARSE_V - T) as usize;
+    for (i, &b) in sparse_beta.iter().enumerate() {
+        solve_beta[i + offset] = b;
+    }
+
+    // p = 0 → m = 1, so solve_ml returns m · y = y = n directly.
+    solve_ml(alpha, &solve_beta, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

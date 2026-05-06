@@ -75,7 +75,8 @@ fn main() {
 
     for target_pct in [2.0_f64, 1.5, 1.0, 0.7, 0.5] {
         let target = target_pct / 100.0;
-        let (ell_p, ell_b) = smallest_meeting(target, run_ell, |p| (((1u64 << p) as usize) * 7) / 2);
+        let (ell_p, ell_b) =
+            smallest_meeting(target, run_ell, |p| (((1u64 << p) as usize) * 7) / 2);
         let (_, hll6_b) = smallest_meeting(
             target,
             |p| run_hll(p, HllReg::Bits6),
