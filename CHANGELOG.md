@@ -6,6 +6,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-05-07
+
+### Added
+
+- **Bit-for-bit parity with the Dynatrace Java reference** (paper's
+  authoritative implementation at `dynatrace-research/exaloglog-paper`).
+  `tests/java_parity.rs` checks that for every (d ∈ {20, 24}, p ∈ {4,
+  8, 12}, n ∈ {100, 1000, 10000}) configuration, the Rust register
+  state after inserting `splitmix64(0..n)` exactly matches the Java
+  reference's `getState()`. 18 fixtures total. See `notes/java-parity.md`
+  for the capture procedure.
+
 ## [0.4.0] — 2026-05-07
 
 ### Added

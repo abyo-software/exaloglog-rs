@@ -1,0 +1,108 @@
+//! Bit-for-bit parity tests against the Dynatrace Java reference
+//! implementation (github.com/dynatrace-research/exaloglog-paper).
+//!
+//! The fixture files in `tests/fixtures/d*_p*_n*.hex` were captured by
+//! compiling Dynatrace's Java reference, building an `ExaLogLog(t=2,
+//! d=*, p=*)`, inserting `splitmix64(0..n)` and dumping `getState()` as
+//! lowercase hex. This Rust test reproduces the same procedure and
+//! asserts byte-for-byte equality.
+//!
+//! See `notes/java-parity.md` for the captured Java commit and steps to
+//! regenerate the fixtures.
+
+use exaloglog::{ExaLogLog, ExaLogLogFast};
+
+fn splitmix64(x: i64) -> u64 {
+    let mut x = x as u64;
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+fn rust_state_d24(p: u32, n: u32) -> Vec<u8> {
+    let mut s = ExaLogLogFast::new_dense(p);
+    for i in 0..n as i64 {
+        s.add_hash(splitmix64(i));
+    }
+    let snap = s.snapshot();
+    let mut out = Vec::with_capacity(snap.len() * 4);
+    for r in &snap {
+        out.extend_from_slice(&r.to_le_bytes());
+    }
+    out
+}
+
+fn rust_state_d20(p: u32, n: u32) -> Vec<u8> {
+    let mut s = ExaLogLog::new_dense(p);
+    for i in 0..n as i64 {
+        s.add_hash(splitmix64(i));
+    }
+    let bytes = s.to_bytes();
+    bytes[8..].to_vec() // strip 8-byte header
+}
+
+fn load_fixture(d: u32, p: u32, n: u32) -> Vec<u8> {
+    let path = format!("tests/fixtures/d{d}_p{p}_n{n}.hex");
+    let s = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("missing fixture {path}: {e}"));
+    let s = s.trim();
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
+        .collect()
+}
+
+fn check(d: u32, p: u32, n: u32) {
+    let expected = load_fixture(d, p, n);
+    let actual = if d == 24 {
+        rust_state_d24(p, n)
+    } else {
+        rust_state_d20(p, n)
+    };
+    assert_eq!(
+        actual, expected,
+        "Java/Rust state diverged at t=2, d={d}, p={p}, n={n}"
+    );
+}
+
+#[test]
+fn java_parity_d24_p4() {
+    check(24, 4, 100);
+    check(24, 4, 1000);
+    check(24, 4, 10000);
+}
+
+#[test]
+fn java_parity_d24_p8() {
+    check(24, 8, 100);
+    check(24, 8, 1000);
+    check(24, 8, 10000);
+}
+
+#[test]
+fn java_parity_d24_p12() {
+    check(24, 12, 100);
+    check(24, 12, 1000);
+    check(24, 12, 10000);
+}
+
+#[test]
+fn java_parity_d20_p4() {
+    check(20, 4, 100);
+    check(20, 4, 1000);
+    check(20, 4, 10000);
+}
+
+#[test]
+fn java_parity_d20_p8() {
+    check(20, 8, 100);
+    check(20, 8, 1000);
+    check(20, 8, 10000);
+}
+
+#[test]
+fn java_parity_d20_p12() {
+    check(20, 12, 100);
+    check(20, 12, 1000);
+    check(20, 12, 10000);
+}

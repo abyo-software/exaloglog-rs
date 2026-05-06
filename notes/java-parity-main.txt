@@ -1,0 +1,31 @@
+// Reference Main.java for regenerating the Java parity fixtures.
+// See notes/java-parity.md for the build steps.
+
+import com.dynatrace.exaloglogpaper.ExaLogLog;
+
+public class Main {
+    static long splitmix64(long x) {
+        x = x + 0x9E3779B97F4A7C15L;
+        x = (x ^ (x >>> 30)) * 0xBF58476D1CE4E5B9L;
+        x = (x ^ (x >>> 27)) * 0x94D049BB133111EBL;
+        return x ^ (x >>> 31);
+    }
+
+    public static void main(String[] args) {
+        int t = Integer.parseInt(args[0]);
+        int d = Integer.parseInt(args[1]);
+        int p = Integer.parseInt(args[2]);
+        int n = Integer.parseInt(args[3]);
+
+        ExaLogLog sketch = ExaLogLog.create(t, d, p);
+        for (long i = 0; i < n; i++) {
+            sketch.add(splitmix64(i));
+        }
+        byte[] state = sketch.getState();
+        StringBuilder sb = new StringBuilder();
+        for (byte b : state) {
+            sb.append(String.format("%02x", b));
+        }
+        System.out.println(sb.toString());
+    }
+}
