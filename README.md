@@ -91,14 +91,35 @@ Empirical numbers track theory and the ML estimator is essentially unbiased.
 
 ## Throughput
 
-Single-threaded, scalar implementation, on a recent Linux x86_64 machine:
+Single-threaded, scalar implementation, on a recent Linux x86_64 machine
+(AMD Ryzen 9 9950X, rustc 1.95.0 stable):
 
 | variant | `p=8` | `p=12` | `p=16` |
 | --- | ---: | ---: | ---: |
 | `ExaLogLog` (packed) | 101 M ins/s | 46 M ins/s | 39 M ins/s |
 | `ExaLogLogFast` (aligned) | 146 M ins/s | 53 M ins/s | 45 M ins/s |
 
-A SIMD-accelerated batch insert path is planned.
+Concurrent ingest via `add_hash_atomic` scales to **>400 M ins/s at 8
+threads** (`cargo run --release --example concurrent_ingest`).
+
+A SIMD-accelerated batch insert path is on the roadmap.
+
+## Validation
+
+In addition to ~50 unit and property tests, the crate ships a
+**byte-for-byte parity test** against [Dynatrace's Java reference][javaref]:
+register state after inserting `splitmix64(0..n)` is identical to the
+authoritative implementation across `d ∈ {20, 24}`, `p ∈ {4, 8, 12}`,
+and `n ∈ {100, 1000, 10000}`. See `tests/java_parity.rs` and
+`notes/java-parity.md`.
+
+[javaref]: https://github.com/dynatrace-research/exaloglog-paper
+
+## Optional features
+
+- `serde`: derives `Serialize` / `Deserialize` for both sketch types,
+  going through the existing byte format. Works with bincode, JSON,
+  MessagePack, CBOR, and any other serde data format.
 
 ## License
 
