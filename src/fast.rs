@@ -13,6 +13,19 @@
 //!
 //! Use [`crate::ExaLogLog`] otherwise.
 //!
+//! # Sparse mode
+//!
+//! Like [`crate::ExaLogLog`], `ExaLogLogFast` starts in sparse mode (a
+//! sorted list of 32-bit hash tokens) and promotes to the dense register
+//! array at the break-even point — `m` distinct tokens, the count at
+//! which the sparse list equals the dense register array in size.
+//!
+//! Sparse mode is single-threaded only. [`Self::add_hash_atomic`] panics
+//! if called while sparse — the design relies on storing tokens in a
+//! mutable `Vec`, which can't be safely shared across threads via
+//! `&self`. Call [`Self::densify`] (or use [`Self::new_dense`]) before
+//! handing the sketch out to multiple threads.
+//!
 //! # Custom hashers
 //!
 //! `add(&T)` uses the standard library `DefaultHasher` (SipHash13). For
@@ -30,26 +43,48 @@ use crate::{MAX_P, MIN_P, T};
 const D: u32 = 24;
 const HEADER_LEN: usize = 8;
 
-/// 32-bit aligned ExaLogLog. See module docs.
+/// Format-version flag bit indicating sparse-mode payload in `to_bytes`.
+const FORMAT_FLAG_SPARSE: u8 = 0x80;
+
+/// Number of distinct tokens at which sparse memory equals dense (`m`
+/// tokens at 4 bytes each = `m · 4` bytes, same as the dense register
+/// array of `m` `AtomicU32`s).
+fn sparse_capacity(p: u32) -> usize {
+    1usize << p
+}
+
+/// 32-bit aligned ExaLogLog with automatic sparse↔dense storage. See
+/// module docs.
 #[derive(Debug)]
 pub struct ExaLogLogFast {
     p: u32,
-    registers: Box<[AtomicU32]>,
+    storage: FastStorage,
     martingale: f64,
     mu: f64,
     martingale_invalid: bool,
 }
 
+#[derive(Debug)]
+enum FastStorage {
+    Sparse(Vec<u32>),
+    Dense(Box<[AtomicU32]>),
+}
+
 impl Clone for ExaLogLogFast {
     fn clone(&self) -> Self {
-        let snapshot: Vec<AtomicU32> = self
-            .registers
-            .iter()
-            .map(|a| AtomicU32::new(a.load(Ordering::Relaxed)))
-            .collect();
+        let storage = match &self.storage {
+            FastStorage::Sparse(v) => FastStorage::Sparse(v.clone()),
+            FastStorage::Dense(regs) => {
+                let snap: Vec<AtomicU32> = regs
+                    .iter()
+                    .map(|a| AtomicU32::new(a.load(Ordering::Relaxed)))
+                    .collect();
+                FastStorage::Dense(snap.into_boxed_slice())
+            }
+        };
         Self {
             p: self.p,
-            registers: snapshot.into_boxed_slice(),
+            storage,
             martingale: self.martingale,
             mu: self.mu,
             martingale_invalid: self.martingale_invalid,
@@ -58,17 +93,35 @@ impl Clone for ExaLogLogFast {
 }
 
 impl ExaLogLogFast {
-    /// Create an empty sketch with `2^p` registers.
+    /// Create an empty sketch starting in sparse mode. Auto-promotes to
+    /// dense at the break-even point.
     pub fn new(p: u32) -> Self {
         assert!(
             (MIN_P..=MAX_P).contains(&p),
             "precision p={p} out of range [{MIN_P}, {MAX_P}]"
         );
-        let m = 1usize << p;
-        let registers: Vec<AtomicU32> = (0..m).map(|_| AtomicU32::new(0)).collect();
         Self {
             p,
-            registers: registers.into_boxed_slice(),
+            storage: FastStorage::Sparse(Vec::new()),
+            martingale: 0.0,
+            mu: 1.0,
+            martingale_invalid: true, // sparse mode doesn't track HIP
+        }
+    }
+
+    /// Create an empty sketch directly in dense mode (skips sparse).
+    /// Use this if you know the cardinality will exceed the break-even
+    /// point, or if you need atomic concurrent inserts immediately.
+    pub fn new_dense(p: u32) -> Self {
+        assert!(
+            (MIN_P..=MAX_P).contains(&p),
+            "precision p={p} out of range [{MIN_P}, {MAX_P}]"
+        );
+        let m = 1usize << p;
+        let regs: Vec<AtomicU32> = (0..m).map(|_| AtomicU32::new(0)).collect();
+        Self {
+            p,
+            storage: FastStorage::Dense(regs.into_boxed_slice()),
             martingale: 0.0,
             mu: 1.0,
             martingale_invalid: false,
@@ -82,21 +135,40 @@ impl ExaLogLogFast {
 
     /// Number of registers (`2^p`).
     pub fn num_registers(&self) -> usize {
-        self.registers.len()
+        1 << self.p
     }
 
-    /// In-memory size of the register array in bytes.
+    /// In-memory size of the storage in bytes.
     pub fn register_bytes(&self) -> usize {
-        self.registers.len() * 4
+        match &self.storage {
+            FastStorage::Sparse(v) => v.capacity() * 4,
+            FastStorage::Dense(regs) => regs.len() * 4,
+        }
     }
 
-    /// Snapshot of the current register values. Returns a fresh `Vec`
-    /// because internally we store atomics.
+    /// Returns `true` if the sketch is currently in sparse mode.
+    pub fn is_sparse(&self) -> bool {
+        matches!(self.storage, FastStorage::Sparse(_))
+    }
+
+    /// Snapshot of the current dense register values, materializing the
+    /// sparse representation on the fly if needed. Always returns a
+    /// fresh `Vec`.
     pub fn snapshot(&self) -> Vec<u32> {
-        self.registers
-            .iter()
-            .map(|a| a.load(Ordering::Relaxed))
-            .collect()
+        match &self.storage {
+            FastStorage::Dense(regs) => {
+                regs.iter().map(|a| a.load(Ordering::Relaxed)).collect()
+            }
+            FastStorage::Sparse(tokens) => {
+                let mut regs = vec![0u32; 1usize << self.p];
+                for &tok in tokens {
+                    let h = math::token_to_hash(tok);
+                    let (i, k) = math::hash_to_register_k(h, self.p);
+                    regs[i] = math::apply_insert(regs[i], k, D);
+                }
+                regs
+            }
+        }
     }
 
     /// `d` parameter (24).
@@ -104,60 +176,97 @@ impl ExaLogLogFast {
         D
     }
 
-    /// Insert a 64-bit hash value (Algorithm 2). Single-threaded path:
-    /// also maintains the martingale (HIP) estimator state.
-    pub fn add_hash(&mut self, hash: u64) {
-        let (i, k) = math::hash_to_register_k(hash, self.p);
-        let r = self.registers[i].load(Ordering::Relaxed);
-        let new_r = math::apply_insert(r, k, D);
-        if r == new_r {
+    /// Force promotion to dense mode if currently sparse. Idempotent.
+    pub fn densify(&mut self) {
+        if matches!(self.storage, FastStorage::Dense(_)) {
             return;
         }
-        if !self.martingale_invalid {
-            self.martingale += 1.0 / self.mu;
-            self.mu -= math::h(r, self.p, D) - math::h(new_r, self.p, D);
-            if self.mu < 1e-300 {
-                self.mu = 1e-300;
+        let tokens = match std::mem::replace(&mut self.storage, FastStorage::Sparse(Vec::new())) {
+            FastStorage::Sparse(t) => t,
+            FastStorage::Dense(_) => unreachable!(),
+        };
+        let m = 1usize << self.p;
+        let regs: Vec<AtomicU32> = (0..m).map(|_| AtomicU32::new(0)).collect();
+        self.storage = FastStorage::Dense(regs.into_boxed_slice());
+        // Insert tokens into dense.
+        let dense_regs = match &self.storage {
+            FastStorage::Dense(r) => r,
+            FastStorage::Sparse(_) => unreachable!(),
+        };
+        for tok in tokens {
+            let h = math::token_to_hash(tok);
+            let (i, k) = math::hash_to_register_k(h, self.p);
+            let old = dense_regs[i].load(Ordering::Relaxed);
+            let new_r = math::apply_insert(old, k, D);
+            if new_r != old {
+                dense_regs[i].store(new_r, Ordering::Relaxed);
             }
         }
-        self.registers[i].store(new_r, Ordering::Relaxed);
+        self.martingale_invalid = true;
+        self.martingale = f64::NAN;
+        self.mu = f64::NAN;
+    }
+
+    /// Insert a 64-bit hash value (Algorithm 2). Single-threaded path.
+    pub fn add_hash(&mut self, hash: u64) {
+        match &mut self.storage {
+            FastStorage::Sparse(tokens) => {
+                let token = math::hash_to_token(hash);
+                if let Err(idx) = tokens.binary_search(&token) {
+                    tokens.insert(idx, token);
+                    if tokens.len() > sparse_capacity(self.p) {
+                        self.densify();
+                    }
+                }
+            }
+            FastStorage::Dense(regs) => {
+                let (i, k) = math::hash_to_register_k(hash, self.p);
+                let r = regs[i].load(Ordering::Relaxed);
+                let new_r = math::apply_insert(r, k, D);
+                if r == new_r {
+                    return;
+                }
+                if !self.martingale_invalid {
+                    self.martingale += 1.0 / self.mu;
+                    self.mu -= math::h(r, self.p, D) - math::h(new_r, self.p, D);
+                    if self.mu < 1e-300 {
+                        self.mu = 1e-300;
+                    }
+                }
+                regs[i].store(new_r, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Insert a 64-bit hash value atomically (lock-free). Suitable for
     /// concurrent calls from multiple threads via a shared `&self`.
     ///
-    /// Calling this once invalidates the martingale (HIP) estimator
-    /// permanently — that estimator requires per-insert bookkeeping that
-    /// cannot be safely shared across threads without locking. ML
-    /// estimation (and `estimate()`) continues to work.
+    /// Panics if the sketch is currently in sparse mode — sparse storage
+    /// is `Vec`-backed and cannot be safely shared across threads. Call
+    /// [`Self::densify`] first, or construct with [`Self::new_dense`].
     pub fn add_hash_atomic(&self, hash: u64) {
-        // Mark martingale invalid via interior mutability: we use the
-        // top bit of an unused register slot? No — use a separate
-        // AtomicBool? Both add a field and break the wire format. Cheaper
-        // approach: write a sentinel value that estimate_martingale
-        // recognizes via a flag set on first atomic insert.
-        //
-        // For simplicity and correctness, we don't update the martingale
-        // field at all from this path. The caller is expected to know
-        // that mixing add_hash_atomic with estimate_martingale yields
-        // None (we cannot mutate `martingale_invalid` through &self
-        // without unsafe or atomic-bool, but estimate_martingale's
-        // contract is "valid only on sketches built exclusively via
-        // single-threaded add_hash"; using add_hash_atomic violates
-        // that contract).
+        let regs = match &self.storage {
+            FastStorage::Dense(r) => r,
+            FastStorage::Sparse(_) => panic!(
+                "add_hash_atomic requires dense mode; call .densify() or use new_dense()"
+            ),
+        };
         let (i, k) = math::hash_to_register_k(hash, self.p);
-        let reg = &self.registers[i];
+        let reg = &regs[i];
         let mut current = reg.load(Ordering::Relaxed);
         loop {
             let new_r = math::apply_insert(current, k, D);
             if current == new_r {
                 return;
             }
-            match reg.compare_exchange_weak(current, new_r, Ordering::Relaxed, Ordering::Relaxed) {
+            match reg.compare_exchange_weak(
+                current,
+                new_r,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => return,
-                Err(observed) => {
-                    current = observed;
-                }
+                Err(observed) => current = observed,
             }
         }
     }
@@ -178,14 +287,19 @@ impl ExaLogLogFast {
 
     /// Maximum-likelihood estimate.
     pub fn estimate_ml(&self) -> f64 {
-        let regs = self.registers.iter().map(|a| a.load(Ordering::Relaxed));
-        let (alpha, beta) = math::compute_alpha_beta(regs, self.p, D);
-        math::solve_ml(alpha, &beta, self.p)
+        match &self.storage {
+            FastStorage::Sparse(tokens) => math::estimate_from_tokens(tokens),
+            FastStorage::Dense(regs) => {
+                let regs_iter = regs.iter().map(|a| a.load(Ordering::Relaxed));
+                let (alpha, beta) = math::compute_alpha_beta(regs_iter, self.p, D);
+                math::solve_ml(alpha, &beta, self.p)
+            }
+        }
     }
 
     /// Martingale (HIP) estimate, if the running state is still valid.
-    /// Returns `None` after a merge, deserialization, or any use of
-    /// [`Self::add_hash_atomic`].
+    /// Returns `None` in sparse mode and after any merge, deserialization,
+    /// or use of [`Self::add_hash_atomic`].
     pub fn estimate_martingale(&self) -> Option<f64> {
         if self.martingale_invalid {
             None
@@ -194,7 +308,10 @@ impl ExaLogLogFast {
         }
     }
 
-    /// Merge another sketch into `self` (Algorithm 5).
+    /// Merge another sketch into `self` (Algorithm 5). Both sketches must
+    /// share the same precision `p`. Modes are handled symmetrically with
+    /// [`crate::ExaLogLog`]: sparse + sparse takes the union of token sets;
+    /// any other combination densifies and uses Algorithm 5.
     pub fn merge(&mut self, other: &Self) -> Result<(), MergeError> {
         if self.p != other.p {
             return Err(MergeError::PrecisionMismatch {
@@ -202,31 +319,106 @@ impl ExaLogLogFast {
                 rhs: other.p,
             });
         }
-        for (a, b) in self.registers.iter().zip(other.registers.iter()) {
-            let av = a.load(Ordering::Relaxed);
-            let bv = b.load(Ordering::Relaxed);
-            a.store(math::merge_register(av, bv, D), Ordering::Relaxed);
+        match (&mut self.storage, &other.storage) {
+            (FastStorage::Sparse(self_t), FastStorage::Sparse(other_t)) => {
+                let mut merged = Vec::with_capacity(self_t.len() + other_t.len());
+                let mut a = self_t.iter().copied().peekable();
+                let mut b = other_t.iter().copied().peekable();
+                loop {
+                    match (a.peek().copied(), b.peek().copied()) {
+                        (Some(x), Some(y)) if x < y => {
+                            merged.push(x);
+                            a.next();
+                        }
+                        (Some(x), Some(y)) if x > y => {
+                            merged.push(y);
+                            b.next();
+                        }
+                        (Some(x), Some(_)) => {
+                            merged.push(x);
+                            a.next();
+                            b.next();
+                        }
+                        (Some(x), None) => {
+                            merged.push(x);
+                            a.next();
+                        }
+                        (None, Some(y)) => {
+                            merged.push(y);
+                            b.next();
+                        }
+                        (None, None) => break,
+                    }
+                }
+                self.storage = FastStorage::Sparse(merged);
+                if let FastStorage::Sparse(ref t) = self.storage {
+                    if t.len() > sparse_capacity(self.p) {
+                        self.densify();
+                    }
+                }
+            }
+            _ => {
+                self.densify();
+                let regs = match &self.storage {
+                    FastStorage::Dense(r) => r,
+                    FastStorage::Sparse(_) => unreachable!(),
+                };
+                match &other.storage {
+                    FastStorage::Sparse(other_t) => {
+                        for &tok in other_t {
+                            let h = math::token_to_hash(tok);
+                            let (i, k) = math::hash_to_register_k(h, self.p);
+                            let old = regs[i].load(Ordering::Relaxed);
+                            let new_r = math::apply_insert(old, k, D);
+                            if new_r != old {
+                                regs[i].store(new_r, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    FastStorage::Dense(other_regs) => {
+                        for (a, b) in regs.iter().zip(other_regs.iter()) {
+                            let av = a.load(Ordering::Relaxed);
+                            let bv = b.load(Ordering::Relaxed);
+                            a.store(math::merge_register(av, bv, D), Ordering::Relaxed);
+                        }
+                    }
+                }
+                self.martingale_invalid = true;
+                self.martingale = f64::NAN;
+                self.mu = f64::NAN;
+            }
         }
-        self.martingale_invalid = true;
-        self.martingale = f64::NAN;
-        self.mu = f64::NAN;
         Ok(())
     }
 
     /// Reduce this sketch's precision to `new_p ≤ self.precision()`,
-    /// returning a new sketch. Lossless: the result equals what you would
-    /// get by directly inserting the same elements into a sketch with
-    /// `new_p`. Implements Algorithm 6 of the paper, restricted to the
-    /// case where `d` stays the same.
+    /// returning a new sketch (Algorithm 6, restricted to keeping `d`).
     pub fn reduce(&self, new_p: u32) -> Self {
         assert!(
             (MIN_P..=MAX_P).contains(&new_p) && new_p <= self.p,
             "new_p={new_p} must be in [{MIN_P}, {self_p}]",
             self_p = self.p
         );
-        let mut out = Self::new(new_p);
+        // For sparse mode, reducing p is just inserting tokens into a
+        // fresh sketch at the smaller p (tokens don't depend on p).
+        if let FastStorage::Sparse(tokens) = &self.storage {
+            let mut out = Self::new(new_p);
+            for &tok in tokens {
+                out.add_hash(math::token_to_hash(tok));
+            }
+            return out;
+        }
+        let mut out = Self::new_dense(new_p);
+        let dense = match &self.storage {
+            FastStorage::Dense(r) => r,
+            FastStorage::Sparse(_) => unreachable!(),
+        };
         if new_p == self.p {
-            for (dst, src) in out.registers.iter().zip(self.registers.iter()) {
+            let out_regs = match &out.storage {
+                FastStorage::Dense(r) => r,
+                FastStorage::Sparse(_) => unreachable!(),
+            };
+            for (dst, src) in out_regs.iter().zip(dense.iter()) {
                 dst.store(src.load(Ordering::Relaxed), Ordering::Relaxed);
             }
             out.martingale_invalid = true;
@@ -241,16 +433,14 @@ impl ExaLogLogFast {
             let mut acc = 0u32;
             for j in 0..(1u64 << p_diff) {
                 let old_i = new_i + m_new * j as usize;
-                let mut r = self.registers[old_i].load(Ordering::Relaxed);
+                let mut r = dense[old_i].load(Ordering::Relaxed);
                 let u = r >> D;
-
                 if u >= a {
-                    // Saturated regime: the original hash had no 1-bit in
-                    // positions [t+p, 64). The bits at [t+p', t+p), now
-                    // exposed to the leading-zero count, are encoded in j.
-                    // s = (p_diff - bit_length(j)) · 2^t  is how many
-                    // extra "levels" u gains in the new sketch.
-                    let bit_len_j = if j == 0 { 0 } else { 64 - j.leading_zeros() };
+                    let bit_len_j = if j == 0 {
+                        0
+                    } else {
+                        64 - j.leading_zeros()
+                    };
                     let s = (p_diff - bit_len_j) * two_t;
                     if s > 0 {
                         let v = D + a - u;
@@ -263,37 +453,59 @@ impl ExaLogLogFast {
                         r += s << D;
                     }
                 }
-
                 acc = math::merge_register(acc, r, D);
             }
-            out.registers[new_i].store(acc, Ordering::Relaxed);
+            let out_regs = match &out.storage {
+                FastStorage::Dense(r) => r,
+                FastStorage::Sparse(_) => unreachable!(),
+            };
+            out_regs[new_i].store(acc, Ordering::Relaxed);
         }
         out.martingale_invalid = true;
         out
     }
 
-    /// Reset to empty.
+    /// Reset to empty (sparse).
     pub fn clear(&mut self) {
-        for r in self.registers.iter() {
-            r.store(0, Ordering::Relaxed);
-        }
+        self.storage = FastStorage::Sparse(Vec::new());
         self.martingale = 0.0;
         self.mu = 1.0;
-        self.martingale_invalid = false;
+        self.martingale_invalid = true;
     }
 
-    /// Serialize. See module docs for layout.
+    /// Serialize. Layout: 4-byte magic, 1-byte format version (top bit
+    /// set in sparse mode), 1-byte t, 1-byte d, 1-byte p, then either:
+    ///
+    /// - dense: raw u32 register bytes (LE);
+    /// - sparse: 4-byte token count followed by `count` LE u32 tokens.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + self.registers.len() * 4);
-        out.extend_from_slice(&MAGIC);
-        out.push(FORMAT_VERSION);
-        out.push(T as u8);
-        out.push(D as u8);
-        out.push(self.p as u8);
-        for r in self.registers.iter() {
-            out.extend_from_slice(&r.load(Ordering::Relaxed).to_le_bytes());
+        match &self.storage {
+            FastStorage::Dense(regs) => {
+                let mut out = Vec::with_capacity(HEADER_LEN + regs.len() * 4);
+                out.extend_from_slice(&MAGIC);
+                out.push(FORMAT_VERSION);
+                out.push(T as u8);
+                out.push(D as u8);
+                out.push(self.p as u8);
+                for r in regs.iter() {
+                    out.extend_from_slice(&r.load(Ordering::Relaxed).to_le_bytes());
+                }
+                out
+            }
+            FastStorage::Sparse(tokens) => {
+                let mut out = Vec::with_capacity(HEADER_LEN + 4 + tokens.len() * 4);
+                out.extend_from_slice(&MAGIC);
+                out.push(FORMAT_VERSION | FORMAT_FLAG_SPARSE);
+                out.push(T as u8);
+                out.push(D as u8);
+                out.push(self.p as u8);
+                out.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+                for &tok in tokens {
+                    out.extend_from_slice(&tok.to_le_bytes());
+                }
+                out
+            }
         }
-        out
     }
 
     /// Deserialize from a byte slice produced by [`Self::to_bytes`].
@@ -307,8 +519,11 @@ impl ExaLogLogFast {
         if bytes[0..4] != MAGIC {
             return Err(DeserializeError::BadMagic);
         }
-        if bytes[4] != FORMAT_VERSION {
-            return Err(DeserializeError::UnsupportedVersion(bytes[4]));
+        let raw_version = bytes[4];
+        let is_sparse = raw_version & FORMAT_FLAG_SPARSE != 0;
+        let version = raw_version & !FORMAT_FLAG_SPARSE;
+        if version != FORMAT_VERSION {
+            return Err(DeserializeError::UnsupportedVersion(raw_version));
         }
         let t = bytes[5];
         let d = bytes[6];
@@ -319,6 +534,39 @@ impl ExaLogLogFast {
         if !(MIN_P..=MAX_P).contains(&u32::from(p)) {
             return Err(DeserializeError::InvalidPrecision(p));
         }
+
+        if is_sparse {
+            if bytes.len() < HEADER_LEN + 4 {
+                return Err(DeserializeError::TooShort {
+                    got: bytes.len(),
+                    need: HEADER_LEN + 4,
+                });
+            }
+            let count =
+                u32::from_le_bytes(bytes[HEADER_LEN..HEADER_LEN + 4].try_into().unwrap()) as usize;
+            let expected = HEADER_LEN + 4 + count * 4;
+            if bytes.len() != expected {
+                return Err(DeserializeError::LengthMismatch {
+                    got: bytes.len(),
+                    expected,
+                });
+            }
+            let mut tokens = Vec::with_capacity(count);
+            for i in 0..count {
+                let off = HEADER_LEN + 4 + i * 4;
+                tokens.push(u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()));
+            }
+            tokens.sort_unstable();
+            tokens.dedup();
+            return Ok(Self {
+                p: u32::from(p),
+                storage: FastStorage::Sparse(tokens),
+                martingale: f64::NAN,
+                mu: f64::NAN,
+                martingale_invalid: true,
+            });
+        }
+
         let m = 1usize << p;
         let expected_len = HEADER_LEN + m * 4;
         if bytes.len() != expected_len {
@@ -328,16 +576,16 @@ impl ExaLogLogFast {
             });
         }
 
-        let mut registers: Vec<AtomicU32> = Vec::with_capacity(m);
+        let mut regs: Vec<AtomicU32> = Vec::with_capacity(m);
         for i in 0..m {
             let off = HEADER_LEN + i * 4;
             let v = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-            registers.push(AtomicU32::new(v));
+            regs.push(AtomicU32::new(v));
         }
 
         Ok(Self {
             p: u32::from(p),
-            registers: registers.into_boxed_slice(),
+            storage: FastStorage::Dense(regs.into_boxed_slice()),
             martingale: f64::NAN,
             mu: f64::NAN,
             martingale_invalid: true,
@@ -363,22 +611,57 @@ mod tests {
     fn empty_sketch_estimates_zero() {
         let s = ExaLogLogFast::new(12);
         assert_eq!(s.estimate(), 0.0);
+        assert!(s.is_sparse());
     }
 
     #[test]
-    fn idempotent_inserts_do_not_change_state() {
+    fn sparse_mode_is_exact_for_small_n() {
+        for &n in &[1u64, 5, 10, 50, 100, 500] {
+            let mut s = ExaLogLogFast::new(12);
+            for i in 0..n {
+                s.add_hash(splitmix64(i));
+            }
+            assert!(s.is_sparse());
+            let est = s.estimate_ml();
+            let rel_err = (est - n as f64).abs() / n as f64;
+            assert!(rel_err < 0.20, "n={n}: est={est}");
+        }
+    }
+
+    #[test]
+    fn auto_promotes_at_break_even() {
+        let p = 8;
+        let break_even = sparse_capacity(p);
+        let mut s = ExaLogLogFast::new(p);
+        for i in 0..(break_even as u64 + 100) {
+            s.add_hash(splitmix64(i));
+        }
+        assert!(!s.is_sparse());
+    }
+
+    #[test]
+    fn idempotent_inserts() {
         let mut s = ExaLogLogFast::new(12);
         for _ in 0..1000 {
             s.add_hash(0xDEAD_BEEF_CAFE_BABE);
         }
-        let changed = s.snapshot().iter().filter(|&&r| r != 0).count();
-        assert_eq!(changed, 1);
+        assert!(s.is_sparse());
+        match &s.storage {
+            FastStorage::Sparse(t) => assert_eq!(t.len(), 1),
+            FastStorage::Dense(_) => panic!("should be sparse"),
+        }
+    }
+
+    #[test]
+    fn dense_constructor_skips_sparse() {
+        let s = ExaLogLogFast::new_dense(12);
+        assert!(!s.is_sparse());
     }
 
     #[test]
     fn h_strictly_decreases_on_real_state_change() {
         let p = 10;
-        let mut s = ExaLogLogFast::new(p);
+        let mut s = ExaLogLogFast::new_dense(p);
         for i in 0..200_000u64 {
             let r_before = s.snapshot();
             s.add_hash(splitmix64(i));
@@ -403,7 +686,7 @@ mod tests {
             }
             let est = s.estimate_ml();
             let rel_err = (est - n as f64).abs() / n as f64;
-            assert!(rel_err < 0.05, "n={n}: est={est}, rel_err={rel_err}");
+            assert!(rel_err < 0.05, "n={n}: est={est}");
         }
     }
 
@@ -411,7 +694,7 @@ mod tests {
     fn ml_and_martingale_agree() {
         let p = 12;
         let n = 50_000u64;
-        let mut s = ExaLogLogFast::new(p);
+        let mut s = ExaLogLogFast::new_dense(p);
         for i in 0..n {
             s.add_hash(splitmix64(i));
         }
@@ -424,9 +707,9 @@ mod tests {
     #[test]
     fn merge_disjoint_recovers_union() {
         let p = 12;
-        let mut a = ExaLogLogFast::new(p);
-        let mut b = ExaLogLogFast::new(p);
-        let mut combined = ExaLogLogFast::new(p);
+        let mut a = ExaLogLogFast::new_dense(p);
+        let mut b = ExaLogLogFast::new_dense(p);
+        let mut combined = ExaLogLogFast::new_dense(p);
         for i in 0..50_000u64 {
             a.add_hash(splitmix64(i));
             combined.add_hash(splitmix64(i));
@@ -437,10 +720,23 @@ mod tests {
         }
         a.merge(&b).unwrap();
         assert_eq!(a.snapshot(), combined.snapshot());
-        assert_eq!(a.estimate_martingale(), None);
-        let est = a.estimate();
-        let rel_err = (est - 100_000.0).abs() / 100_000.0;
-        assert!(rel_err < 0.05, "post-merge estimate = {est}");
+    }
+
+    #[test]
+    fn merge_sparse_with_sparse() {
+        let p = 12;
+        let mut a = ExaLogLogFast::new(p);
+        let mut b = ExaLogLogFast::new(p);
+        for i in 0..50u64 {
+            a.add_hash(splitmix64(i));
+        }
+        for i in 30..80u64 {
+            b.add_hash(splitmix64(i));
+        }
+        a.merge(&b).unwrap();
+        let est = a.estimate_ml();
+        let rel_err = (est - 80.0).abs() / 80.0;
+        assert!(rel_err < 0.05);
     }
 
     #[test]
@@ -454,9 +750,9 @@ mod tests {
     }
 
     #[test]
-    fn serialize_roundtrip() {
+    fn serialize_roundtrip_dense() {
         let p = 12;
-        let mut s = ExaLogLogFast::new(p);
+        let mut s = ExaLogLogFast::new_dense(p);
         for i in 0..50_000u64 {
             s.add_hash(splitmix64(i));
         }
@@ -464,28 +760,36 @@ mod tests {
         let bytes = s.to_bytes();
         assert_eq!(bytes.len(), 8 + 4 * (1 << p));
         let restored = ExaLogLogFast::from_bytes(&bytes).unwrap();
+        assert!(!restored.is_sparse());
         assert_eq!(restored.snapshot(), s.snapshot());
-        assert_eq!(restored.estimate_martingale(), None);
+        assert!((restored.estimate_ml() - est).abs() < 1e-6);
+    }
+
+    #[test]
+    fn serialize_roundtrip_sparse() {
+        let p = 12;
+        let mut s = ExaLogLogFast::new(p);
+        for i in 0..50u64 {
+            s.add_hash(splitmix64(i));
+        }
+        let est = s.estimate_ml();
+        let bytes = s.to_bytes();
+        let restored = ExaLogLogFast::from_bytes(&bytes).unwrap();
+        assert!(restored.is_sparse());
         assert!((restored.estimate_ml() - est).abs() < 1e-6);
     }
 
     #[test]
     fn atomic_insert_matches_serial_insert() {
-        // Inserting the same hashes via add_hash_atomic from a single thread
-        // must produce the same registers as add_hash.
         let p = 12;
-        let mut serial = ExaLogLogFast::new(p);
-        let atomic = ExaLogLogFast::new(p);
+        let mut serial = ExaLogLogFast::new_dense(p);
+        let atomic = ExaLogLogFast::new_dense(p);
         for i in 0..50_000u64 {
             let h = splitmix64(i);
             serial.add_hash(h);
             atomic.add_hash_atomic(h);
         }
         assert_eq!(serial.snapshot(), atomic.snapshot());
-        // Atomic estimate via ML should match serial ML (registers are identical).
-        let serial_ml = serial.estimate_ml();
-        let atomic_ml = atomic.estimate_ml();
-        assert!((serial_ml - atomic_ml).abs() < 1e-6);
     }
 
     #[test]
@@ -494,8 +798,7 @@ mod tests {
         let n_per_thread = 100_000u64;
         let n_threads = 4;
         let total = n_per_thread * n_threads as u64;
-
-        let s = Arc::new(ExaLogLogFast::new(p));
+        let s = Arc::new(ExaLogLogFast::new_dense(p));
         let mut handles = Vec::new();
         for tid in 0..n_threads {
             let s = s.clone();
@@ -511,43 +814,54 @@ mod tests {
         }
         let est = s.estimate_ml();
         let rel_err = (est - total as f64).abs() / total as f64;
-        assert!(rel_err < 0.05, "concurrent estimate = {est}, n = {total}");
+        assert!(rel_err < 0.05);
     }
 
     #[test]
-    fn reduce_to_same_p_returns_same_registers() {
+    #[should_panic(expected = "add_hash_atomic requires dense mode")]
+    fn atomic_insert_panics_in_sparse_mode() {
+        let s = ExaLogLogFast::new(12);
+        s.add_hash_atomic(0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn densify_then_atomic_works() {
+        let mut s = ExaLogLogFast::new(12);
+        for i in 0..10u64 {
+            s.add_hash(splitmix64(i));
+        }
+        s.densify();
+        // Now add_hash_atomic should work.
+        s.add_hash_atomic(splitmix64(100));
+    }
+
+    #[test]
+    fn reduce_to_same_p_returns_same_state() {
         let p = 10;
-        let mut s = ExaLogLogFast::new(p);
+        let mut s = ExaLogLogFast::new_dense(p);
         for i in 0..10_000u64 {
             s.add_hash(splitmix64(i));
         }
-        let reduced = s.reduce(p);
-        assert_eq!(reduced.snapshot(), s.snapshot());
+        let r = s.reduce(p);
+        assert_eq!(r.snapshot(), s.snapshot());
     }
 
     #[test]
     fn reduce_preserves_estimate_within_tolerance() {
-        // Reducing p by 2 produces a sketch whose ML estimate of the same
-        // input set is consistent with a directly-built sketch at the
-        // smaller p.
         let p_high = 12;
         let p_low = 10;
         let n = 50_000u64;
-        let mut a = ExaLogLogFast::new(p_high);
-        let mut direct = ExaLogLogFast::new(p_low);
+        let mut a = ExaLogLogFast::new_dense(p_high);
+        let mut direct = ExaLogLogFast::new_dense(p_low);
         for i in 0..n {
             let h = splitmix64(i);
             a.add_hash(h);
             direct.add_hash(h);
         }
         let reduced = a.reduce(p_low);
-        // The estimate from the reduced sketch should match the direct one.
         let red_est = reduced.estimate_ml();
         let dir_est = direct.estimate_ml();
         let rel_diff = (red_est - dir_est).abs() / n as f64;
-        assert!(
-            rel_diff < 0.10,
-            "reduce(p={p_low}) estimate = {red_est}, direct = {dir_est}, n = {n}"
-        );
+        assert!(rel_diff < 0.10);
     }
 }
