@@ -1,0 +1,6 @@
+/target
+/Cargo.lock
+/exaloglog-paper.pdf
+**/*.rs.bk
+*.swp
+.DS_Store
