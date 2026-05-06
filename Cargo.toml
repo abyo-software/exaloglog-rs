@@ -24,3 +24,8 @@ exclude = [
 proptest = "1"
 rand = "0.8"
 rand_xoshiro = "0.6"
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+
+[[bench]]
+name = "insert"
+harness = false
