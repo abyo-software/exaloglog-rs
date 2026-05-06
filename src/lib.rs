@@ -79,6 +79,72 @@ impl std::fmt::Display for MergeError {
 
 impl std::error::Error for MergeError {}
 
+/// Error returned when deserializing a byte slice into an `ExaLogLog`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeserializeError {
+    /// Byte slice is shorter than the minimum header length.
+    TooShort {
+        /// Bytes received.
+        got: usize,
+        /// Bytes required (at minimum).
+        need: usize,
+    },
+    /// Magic prefix did not match.
+    BadMagic,
+    /// Format version is not supported by this build.
+    UnsupportedVersion(u8),
+    /// The encoded `t` or `d` parameter does not match what this build supports.
+    ParameterMismatch {
+        /// Encoded `t`.
+        t: u8,
+        /// Encoded `d`.
+        d: u8,
+    },
+    /// Encoded `p` is outside the supported range.
+    InvalidPrecision(u8),
+    /// Length of the byte slice does not match what `p` implies.
+    LengthMismatch {
+        /// Bytes received.
+        got: usize,
+        /// Bytes expected, given the encoded `p`.
+        expected: usize,
+    },
+}
+
+impl std::fmt::Display for DeserializeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeserializeError::TooShort { got, need } => {
+                write!(f, "byte slice too short: got {got}, need at least {need}")
+            }
+            DeserializeError::BadMagic => write!(f, "bad magic prefix"),
+            DeserializeError::UnsupportedVersion(v) => {
+                write!(f, "unsupported format version: {v}")
+            }
+            DeserializeError::ParameterMismatch { t, d } => write!(
+                f,
+                "parameter mismatch: encoded t={t}, d={d}, this build supports t={T}, d={D}"
+            ),
+            DeserializeError::InvalidPrecision(p) => {
+                write!(f, "invalid precision p={p} (allowed: {MIN_P}..={MAX_P})")
+            }
+            DeserializeError::LengthMismatch { got, expected } => write!(
+                f,
+                "length mismatch: got {got} bytes, expected {expected} for given p"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeserializeError {}
+
+/// Magic prefix used by [`ExaLogLog::to_bytes`]. ASCII `"ELL\0"`.
+const MAGIC: [u8; 4] = *b"ELL\0";
+/// Format version. Bumped on incompatible layout changes.
+const FORMAT_VERSION: u8 = 1;
+/// Header byte count: magic(4) + version(1) + t(1) + d(1) + p(1).
+const HEADER_LEN: usize = 8;
+
 /// An ExaLogLog distinct-count sketch with parameters `t = 2`, `d = 24`.
 #[derive(Clone, Debug)]
 pub struct ExaLogLog {
@@ -308,6 +374,75 @@ impl ExaLogLog {
         self.martingale = f64::NAN;
         self.mu = f64::NAN;
         Ok(())
+    }
+
+    /// Serialize to a byte vector.
+    ///
+    /// Layout: 4-byte magic `"ELL\0"`, 1-byte format version, 1-byte `t`,
+    /// 1-byte `d`, 1-byte `p`, then the register array as little-endian
+    /// `u32`s.
+    ///
+    /// The running martingale state is *not* serialized — the deserialized
+    /// sketch's `estimate()` falls back to the ML estimator.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER_LEN + self.registers.len() * 4);
+        out.extend_from_slice(&MAGIC);
+        out.push(FORMAT_VERSION);
+        out.push(T as u8);
+        out.push(D as u8);
+        out.push(self.p as u8);
+        for &r in self.registers.iter() {
+            out.extend_from_slice(&r.to_le_bytes());
+        }
+        out
+    }
+
+    /// Deserialize from a byte slice produced by [`Self::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
+        if bytes.len() < HEADER_LEN {
+            return Err(DeserializeError::TooShort {
+                got: bytes.len(),
+                need: HEADER_LEN,
+            });
+        }
+        if bytes[0..4] != MAGIC {
+            return Err(DeserializeError::BadMagic);
+        }
+        let version = bytes[4];
+        if version != FORMAT_VERSION {
+            return Err(DeserializeError::UnsupportedVersion(version));
+        }
+        let t = bytes[5];
+        let d = bytes[6];
+        if u32::from(t) != T || u32::from(d) != D {
+            return Err(DeserializeError::ParameterMismatch { t, d });
+        }
+        let p = bytes[7];
+        if !(MIN_P..=MAX_P).contains(&u32::from(p)) {
+            return Err(DeserializeError::InvalidPrecision(p));
+        }
+        let m = 1usize << p;
+        let expected_len = HEADER_LEN + m * 4;
+        if bytes.len() != expected_len {
+            return Err(DeserializeError::LengthMismatch {
+                got: bytes.len(),
+                expected: expected_len,
+            });
+        }
+
+        let mut registers = vec![0u32; m].into_boxed_slice();
+        for (i, r) in registers.iter_mut().enumerate() {
+            let off = HEADER_LEN + i * 4;
+            *r = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        }
+
+        Ok(Self {
+            p: u32::from(p),
+            registers,
+            martingale: f64::NAN,
+            mu: f64::NAN,
+            martingale_invalid: true,
+        })
     }
 
     /// Reset the sketch to empty.
@@ -622,6 +757,78 @@ mod tests {
             let s = ExaLogLog::new(p);
             assert_eq!(s.estimate_ml(), 0.0);
         }
+    }
+
+    #[test]
+    fn serialize_roundtrip_preserves_registers_and_estimate() {
+        let p = 12;
+        let mut s = ExaLogLog::new(p);
+        for i in 0..50_000u64 {
+            s.add_hash(splitmix64(i));
+        }
+        let est_before = s.estimate_ml();
+
+        let bytes = s.to_bytes();
+        assert_eq!(bytes.len(), 8 + 4 * (1 << p));
+
+        let restored = ExaLogLog::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.precision(), p);
+        assert_eq!(restored.registers(), s.registers());
+        // Martingale doesn't survive serialization; ML does.
+        assert_eq!(restored.estimate_martingale(), None);
+        let est_after = restored.estimate_ml();
+        assert!((est_before - est_after).abs() < 1e-6);
+    }
+
+    #[test]
+    fn serialize_empty_sketch_roundtrips() {
+        let s = ExaLogLog::new(8);
+        let bytes = s.to_bytes();
+        let restored = ExaLogLog::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.registers(), s.registers());
+        assert_eq!(restored.estimate_ml(), 0.0);
+    }
+
+    #[test]
+    fn deserialize_rejects_bad_inputs() {
+        let s = ExaLogLog::new(8);
+        let good = s.to_bytes();
+
+        // Too short.
+        assert!(matches!(
+            ExaLogLog::from_bytes(&good[..3]),
+            Err(DeserializeError::TooShort { .. })
+        ));
+
+        // Wrong magic.
+        let mut bad = good.clone();
+        bad[0] = b'X';
+        assert_eq!(
+            ExaLogLog::from_bytes(&bad).err(),
+            Some(DeserializeError::BadMagic)
+        );
+
+        // Wrong version.
+        let mut bad = good.clone();
+        bad[4] = 99;
+        assert_eq!(
+            ExaLogLog::from_bytes(&bad).err(),
+            Some(DeserializeError::UnsupportedVersion(99))
+        );
+
+        // Wrong t / d.
+        let mut bad = good.clone();
+        bad[5] = 1;
+        assert_eq!(
+            ExaLogLog::from_bytes(&bad).err(),
+            Some(DeserializeError::ParameterMismatch { t: 1, d: 24 })
+        );
+
+        // Truncated body.
+        assert!(matches!(
+            ExaLogLog::from_bytes(&good[..good.len() - 1]),
+            Err(DeserializeError::LengthMismatch { .. })
+        ));
     }
 
     #[test]
