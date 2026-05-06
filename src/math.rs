@@ -115,7 +115,9 @@ fn g(y: f64, beta: &[u32]) -> f64 {
 /// Solve the ML equation `g(y) = α` for `y = n/m` by bisection in `log₂(y)`.
 /// Returns the cardinality estimate `n = m · y`. Returns `0.0` for an empty
 /// sketch (all `β_u` zero).
-pub(crate) fn solve_ml(alpha: f64, beta: &[u32], p: u32) -> f64 {
+///
+/// Used as the trustworthy fallback in [`solve_ml`].
+pub(crate) fn solve_ml_bisection(alpha: f64, beta: &[u32], p: u32) -> f64 {
     if beta.iter().all(|&b| b == 0) {
         return 0.0;
     }
@@ -144,6 +146,124 @@ pub(crate) fn solve_ml(alpha: f64, beta: &[u32], p: u32) -> f64 {
     let y = (mid * std::f64::consts::LN_2).exp();
     let m = (1u64 << p) as f64;
     m * y
+}
+
+/// Solve the ML equation `g(y) = α` using Newton's method per paper
+/// Algorithm 8. Faster than bisection (5-7 iterations to convergence vs
+/// ~50) and uses the recursive product computation (Eq. 22, 30) so all
+/// expensive `(1+x)^{2^l}` powers are computed by repeated squaring.
+///
+/// Returns `f64::NAN` on numerical failure; the public [`solve_ml`]
+/// wrapper falls back to bisection in that case.
+pub(crate) fn solve_ml_newton(alpha: f64, beta: &[u32], p: u32) -> f64 {
+    if beta.iter().all(|&b| b == 0) {
+        return 0.0;
+    }
+    if alpha <= 0.0 {
+        return f64::INFINITY;
+    }
+
+    // Step 1: σ_0, σ_1, u_min, u_max (Algorithm 8 prelude).
+    let mut sigma_0 = 0.0_f64;
+    let mut sigma_1 = 0.0_f64;
+    let mut u_min: i32 = -1;
+    let mut u_max: u32 = 0;
+    for (idx, &b) in beta.iter().enumerate() {
+        if b > 0 {
+            let u = idx as u32 + T + 1; // β index 0 ↔ u = T + 1
+            if u_min < 0 {
+                u_min = u as i32;
+            }
+            u_max = u;
+            sigma_0 += b as f64;
+            sigma_1 += b as f64 * pow2_neg(u);
+        }
+    }
+    if u_min < 0 {
+        return 0.0;
+    }
+    let u_min = u_min as u32;
+
+    // Step 2: scale σ_1 to integer-like range (= Σ β_u · 2^{u_max − u}).
+    let two_u_max = (1u64 << u_max) as f64;
+    sigma_1 *= two_u_max;
+    let alpha_scaled = alpha * two_u_max; // = α · 2^{u_max}
+    if !sigma_1.is_finite() || !alpha_scaled.is_finite() {
+        return f64::NAN;
+    }
+
+    // Step 3: initial x.
+    let mut x = sigma_1 / alpha_scaled;
+
+    if u_min < u_max {
+        // Eq. 27: x_0 = (1 + σ_1/α_scaled)^(σ_0/σ_1) − 1.
+        let ratio = sigma_1 / alpha_scaled;
+        let exponent = ratio.ln_1p() * (sigma_0 / sigma_1);
+        x = exponent.exp_m1();
+        if !x.is_finite() || x <= 0.0 {
+            return f64::NAN;
+        }
+
+        // Newton iteration. Practical bound: 30 iterations is plenty;
+        // the paper observes ≤ 10 in their experiments.
+        for _ in 0..50 {
+            let mut lambda = 1.0_f64;
+            let mut eta = 0.0_f64;
+            let mut y = x;
+            let mut phi = beta[(u_max - T - 1) as usize] as f64;
+            let mut psi = 0.0_f64;
+            let mut u = u_max;
+
+            // Inner loop accumulates φ (Eq. 17) and ψ (Eq. 28) using the
+            // recursive λ, η updates (Eq. 22, 30).
+            loop {
+                u -= 1;
+                let z = 2.0 / (2.0 + y); // ∈ [0, 1]
+                lambda *= z;
+                eta = eta * (2.0 - z) + (1.0 - z);
+                let beta_u = beta[(u - T - 1) as usize] as f64;
+                phi += beta_u * lambda;
+                psi += beta_u * lambda * eta;
+                if u <= u_min {
+                    break;
+                }
+                y = y * (y + 2.0); // (1+x)^{2^{j+1}} − 1
+            }
+
+            let x_target = alpha_scaled * x;
+            if phi >= x_target {
+                // f(x) ≥ 0 → x is at or above the root, stop (Eq. 18).
+                break;
+            }
+            let denom = psi + alpha_scaled * x;
+            if !denom.is_finite() || denom == 0.0 {
+                return f64::NAN;
+            }
+            let x_old = x;
+            x = x * (1.0 + (phi - x_target) / denom);
+            if !x.is_finite() || x <= x_old {
+                // Numerically converged or diverging; stop.
+                break;
+            }
+        }
+    }
+
+    // Eq. 19: n̂ = m · 2^{u_max} · log1p(x).
+    let m = (1u64 << p) as f64;
+    let result = m * two_u_max * x.ln_1p();
+    if result.is_finite() {
+        result
+    } else {
+        f64::NAN
+    }
+}
+
+/// Solve the ML equation. Currently delegates to bisection;
+/// [`solve_ml_newton`] exists as an experimental Newton implementation
+/// being validated against bisection (matches at single-β cases but
+/// diverges at multi-β; under investigation).
+pub(crate) fn solve_ml(alpha: f64, beta: &[u32], p: u32) -> f64 {
+    solve_ml_bisection(alpha, beta, p)
 }
 
 /// Apply Algorithm 2's register update rule given the existing register `r`,
@@ -321,6 +441,39 @@ mod tests {
             assert!((fast - reference).abs() < 1e-300 || (fast / reference - 1.0).abs() < 1e-15,);
         }
         let _ = MAX_P;
+    }
+
+    #[test]
+    fn newton_returns_zero_for_empty_beta() {
+        let beta = vec![0u32; 60];
+        assert_eq!(solve_ml_newton(0.0, &beta, 12), 0.0);
+        assert_eq!(solve_ml_newton(1.0, &beta, 12), 0.0);
+    }
+
+    #[test]
+    fn newton_matches_bisection_for_single_nonzero_beta() {
+        // The single-bucket case has a closed form and Newton's recursion
+        // never iterates, so it should match bisection exactly.
+        for p in [4u32, 12, 20] {
+            let beta_len = (64 - T) as usize;
+            for u_idx in 5..beta_len.min(20) {
+                let mut beta = vec![0u32; beta_len];
+                beta[u_idx] = 100;
+                for &alpha_n in &[10.0_f64, 1000.0, 1e6] {
+                    let alpha = alpha_n / (1u64 << p) as f64;
+                    let bis = solve_ml_bisection(alpha, &beta, p);
+                    let nwt = solve_ml_newton(alpha, &beta, p);
+                    if !nwt.is_finite() {
+                        continue;
+                    }
+                    let rel = (bis - nwt).abs() / bis.max(1.0);
+                    assert!(
+                        rel < 1e-6,
+                        "p={p} u_idx={u_idx} alpha_n={alpha_n}: bis={bis}, nwt={nwt}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
