@@ -6,6 +6,43 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-06
+
+### Added
+
+- **Sparse mode** for `ExaLogLog` (packed). Sketches start in sparse
+  mode and store hash tokens (paper §4.3) until the per-`m` break-even
+  point, then auto-promote to dense. Sparse mode gives exact distinct
+  counts for small `n` and reduces low-cardinality memory by up to ~30×.
+- `ExaLogLog::new_dense(p)` skips sparse mode if you know `n` will
+  exceed the break-even.
+- `ExaLogLog::is_sparse()` and `ExaLogLog::densify()` exposed for
+  introspection and explicit promotion.
+- **Lock-free atomic insert** on `ExaLogLogFast` via
+  `add_hash_atomic(&self, hash)`. Multiple threads can ingest into a
+  shared sketch without external synchronization. Marks the martingale
+  estimator unavailable for the sketch.
+- **Reduction (Algorithm 6)** on both variants via `reduce(new_p)`,
+  yielding a sketch at lower precision identical to one built directly
+  at `new_p`. Useful for migration scenarios.
+- Module-level documentation for both variants on using `add_hash` with
+  custom hash functions (xxhash3, wyhash, etc.) — the recommended
+  high-throughput path.
+- `ExaLogLogFast::snapshot()` returns the current register values as a
+  `Vec<u32>` (the registers are now atomic internally).
+
+### Changed
+
+- `ExaLogLogFast` now stores registers as `Box<[AtomicU32]>` instead of
+  `Box<[u32]>`. Memory layout, alignment, and serialization format are
+  unchanged.
+- `ExaLogLogFast::registers()` was replaced by `snapshot()`. The old
+  method couldn't return a meaningful `&[u32]` reference once registers
+  were atomic.
+- `ExaLogLog`'s wire format reserves the top bit of the format-version
+  byte to signal sparse-mode payloads. Old `0.1.0` blobs (always dense)
+  remain readable.
+
 ## [0.1.0] — 2026-05-06
 
 Initial release.

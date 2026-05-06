@@ -6,9 +6,8 @@ estimation error as HyperLogLog with **43% less memory**.
 
 [paper]: https://arxiv.org/abs/2402.13726
 
-> **Status:** v0, no public release yet. The math is implemented and
-> validated against theory; head-to-head benchmarks against existing HLL
-> crates and SIMD-accelerated insert paths are in progress.
+[![crates.io](https://img.shields.io/crates/v/exaloglog.svg)](https://crates.io/crates/exaloglog)
+[![docs.rs](https://docs.rs/exaloglog/badge.svg)](https://docs.rs/exaloglog)
 
 ## Why
 
@@ -36,9 +35,23 @@ same RMSE. Use this unless you need lock-free concurrent updates.
 ### `ExaLogLogFast` (32-bit aligned, `d=24`, MVP=3.78)
 
 32-bit registers, one register per `u32`. **41% smaller than HLL** at the
-same RMSE. Slightly faster scalar inserts (~15-30%) and the only variant
-where each register can be updated atomically (CAS-friendly), so prefer
-this for highly concurrent ingest paths.
+same RMSE. Slightly faster scalar inserts (~15-30%) and the variant
+that exposes lock-free concurrent ingest via `add_hash_atomic(&self, hash)`.
+
+### Sparse mode
+
+`ExaLogLog::new(p)` starts in sparse mode and stores 32-bit hash tokens
+until reaching `m · 7/8` distinct elements (the break-even point), then
+promotes to dense. For low-cardinality sketches this means up to ~30×
+less memory and *exact* distinct counts. Skip it with
+`ExaLogLog::new_dense(p)` if you know `n` will be large.
+
+### Reducing precision
+
+Both variants support `reduce(new_p)`, returning a sketch at lower
+precision identical to one that was built directly at `new_p`. Useful
+when you committed to too high a `p` and need to compact existing
+sketches.
 
 ## Usage
 
