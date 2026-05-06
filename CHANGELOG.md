@@ -6,6 +6,33 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-07
+
+### Added
+
+- **Batch insert APIs** on both variants: `add_hashes(&mut self, &[u64])`
+  for single-threaded bulk ingestion and `add_hashes_atomic(&self, &[u64])`
+  on `ExaLogLogFast` for lock-free concurrent batches. The sparse-mode
+  path appends all tokens and then sort-dedupes once (`O(N log N)`)
+  instead of individually binary-search-inserting (`O(N · (log N + N))`).
+- **Property-based test suite** (`tests/properties.rs`) covering merge
+  commutativity, merge associativity, identity-on-empty, insert-order
+  independence, serialize round-trip, and `reduce(p)` parity with
+  directly-built sketches. Eight properties × thirty random cases per
+  `cargo test` invocation.
+- **Worked examples**: `examples/sparse_demo.rs` (memory savings vs
+  cardinality across the sparse → dense transition) and
+  `examples/concurrent_ingest.rs` (multi-threaded `add_hash_atomic`
+  scaling). The latter shows >400 M inserts/second at 8 threads on a
+  recent x86_64 machine.
+
+### Changed
+
+- Internal: `solve_ml_newton` (paper Algorithm 8 scaffolding) is in the
+  tree but not used in production. Single-bucket case validated against
+  bisection; multi-bucket convergence is being debugged. Bisection
+  remains the path `solve_ml` takes.
+
 ## [0.3.0] — 2026-05-07
 
 ### Added

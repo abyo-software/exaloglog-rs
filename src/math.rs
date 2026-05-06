@@ -155,6 +155,10 @@ pub(crate) fn solve_ml_bisection(alpha: f64, beta: &[u32], p: u32) -> f64 {
 ///
 /// Returns `f64::NAN` on numerical failure; the public [`solve_ml`]
 /// wrapper falls back to bisection in that case.
+///
+/// Currently only matches bisection in the single-bucket case; multi-
+/// bucket case is being debugged. Bisection is the production path.
+#[allow(dead_code)]
 pub(crate) fn solve_ml_newton(alpha: f64, beta: &[u32], p: u32) -> f64 {
     if beta.iter().all(|&b| b == 0) {
         return 0.0;
@@ -240,7 +244,7 @@ pub(crate) fn solve_ml_newton(alpha: f64, beta: &[u32], p: u32) -> f64 {
                 return f64::NAN;
             }
             let x_old = x;
-            x = x * (1.0 + (phi - x_target) / denom);
+            x *= 1.0 + (phi - x_target) / denom;
             if !x.is_finite() || x <= x_old {
                 // Numerically converged or diverging; stop.
                 break;
