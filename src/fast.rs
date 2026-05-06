@@ -271,6 +271,38 @@ impl ExaLogLogFast {
         }
     }
 
+    /// Insert a batch of pre-computed 64-bit hashes. Single-threaded.
+    /// Sparse mode bulk-appends and sorts; dense mode tight-loops over
+    /// `add_hash`.
+    pub fn add_hashes(&mut self, hashes: &[u64]) {
+        match &mut self.storage {
+            FastStorage::Sparse(tokens) => {
+                tokens.reserve(hashes.len());
+                for &h in hashes {
+                    tokens.push(math::hash_to_token(h));
+                }
+                tokens.sort_unstable();
+                tokens.dedup();
+                if tokens.len() > sparse_capacity(self.p) {
+                    self.densify();
+                }
+            }
+            FastStorage::Dense(_) => {
+                for &h in hashes {
+                    self.add_hash(h);
+                }
+            }
+        }
+    }
+
+    /// Atomic batch insert. Lock-free. Same constraints as
+    /// [`Self::add_hash_atomic`] — requires dense mode.
+    pub fn add_hashes_atomic(&self, hashes: &[u64]) {
+        for &h in hashes {
+            self.add_hash_atomic(h);
+        }
+    }
+
     /// Insert any hashable value, using the standard library default hasher.
     /// For high-throughput workloads, prefer [`Self::add_hash`] with a
     /// faster hash function.
@@ -833,6 +865,34 @@ mod tests {
         s.densify();
         // Now add_hash_atomic should work.
         s.add_hash_atomic(splitmix64(100));
+    }
+
+    #[test]
+    fn add_hashes_matches_individual_inserts() {
+        let p = 12;
+        let n = 50_000u64;
+        let mut serial = ExaLogLogFast::new_dense(p);
+        let mut batched = ExaLogLogFast::new_dense(p);
+        let hashes: Vec<u64> = (0..n).map(splitmix64).collect();
+        for &h in &hashes {
+            serial.add_hash(h);
+        }
+        batched.add_hashes(&hashes);
+        assert_eq!(serial.snapshot(), batched.snapshot());
+    }
+
+    #[test]
+    fn add_hashes_atomic_matches_serial_atomic() {
+        let p = 12;
+        let n = 50_000u64;
+        let serial = ExaLogLogFast::new_dense(p);
+        let batched = ExaLogLogFast::new_dense(p);
+        let hashes: Vec<u64> = (0..n).map(splitmix64).collect();
+        for &h in &hashes {
+            serial.add_hash_atomic(h);
+        }
+        batched.add_hashes_atomic(&hashes);
+        assert_eq!(serial.snapshot(), batched.snapshot());
     }
 
     #[test]

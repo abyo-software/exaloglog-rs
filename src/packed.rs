@@ -273,6 +273,32 @@ impl ExaLogLog {
         }
     }
 
+    /// Insert a batch of pre-computed 64-bit hashes. In sparse mode this
+    /// appends all tokens at once and sorts/dedupes in `O(N log N)`,
+    /// promoting to dense if the result crosses the break-even
+    /// threshold. In dense mode it's a tight loop over `add_hash` —
+    /// modern compilers auto-vectorize the bit-twiddling work.
+    pub fn add_hashes(&mut self, hashes: &[u64]) {
+        match &mut self.storage {
+            Storage::Sparse(tokens) => {
+                tokens.reserve(hashes.len());
+                for &h in hashes {
+                    tokens.push(math::hash_to_token(h));
+                }
+                tokens.sort_unstable();
+                tokens.dedup();
+                if tokens.len() > sparse_capacity(self.p) {
+                    self.densify();
+                }
+            }
+            Storage::Dense(_) => {
+                for &h in hashes {
+                    self.add_hash(h);
+                }
+            }
+        }
+    }
+
     /// Insert any hashable value, using the standard library default hasher.
     /// For high-throughput workloads, prefer [`Self::add_hash`] with a
     /// faster hash function (xxhash3, wyhash, etc.).
@@ -829,6 +855,39 @@ mod tests {
         let dir_est = direct.estimate_ml();
         let rel_diff = (red_est - dir_est).abs() / n as f64;
         assert!(rel_diff < 0.10, "reduced={red_est}, direct={dir_est}");
+    }
+
+    #[test]
+    fn add_hashes_matches_individual_inserts() {
+        for p in [8u32, 12] {
+            let n = 50_000u64;
+            let mut serial = ExaLogLog::new(p);
+            let mut batched = ExaLogLog::new(p);
+            let hashes: Vec<u64> = (0..n).map(splitmix64).collect();
+            for &h in &hashes {
+                serial.add_hash(h);
+            }
+            batched.add_hashes(&hashes);
+            for i in 0..serial.num_registers() {
+                assert_eq!(
+                    serial.get_register(i),
+                    batched.get_register(i),
+                    "p={p} register {i} differs"
+                );
+            }
+            assert!((serial.estimate_ml() - batched.estimate_ml()).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn add_hashes_in_sparse_mode_dedupes() {
+        let mut s = ExaLogLog::new(12);
+        let hashes: Vec<u64> = (0..50u64).chain(0..50).chain(0..50).map(splitmix64).collect();
+        s.add_hashes(&hashes);
+        assert!(s.is_sparse());
+        let est = s.estimate_ml();
+        let rel_err = (est - 50.0).abs() / 50.0;
+        assert!(rel_err < 0.20, "expected ~50, got {est}");
     }
 
     #[test]
