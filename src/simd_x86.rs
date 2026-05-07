@@ -19,6 +19,11 @@
 //! hashes; the leading-zero call dominates per-hash work but the rest
 //! pipelines cleanly with the next chunk.
 
+// AVX-512 intrinsics are stable since rustc 1.89. The `simd` feature is
+// opt-in and effectively raises the crate's MSRV for users who enable it;
+// the rest of the crate still compiles on the declared 1.85 baseline.
+#![allow(clippy::incompatible_msrv)]
+
 use core::arch::x86_64::*;
 
 const T: u32 = 2;
