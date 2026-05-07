@@ -89,17 +89,78 @@ unsafe fn fill_iks_avx2(hashes: &[u64], p: u32, output: &mut Vec<(u32, u32)>) {
     }
 }
 
-/// Public entry point: dispatches to AVX2 if available, otherwise falls
-/// through to the scalar [`crate::math::fill_iks`].
+/// AVX-512 F + CD variant: 8-wide batch with native vectorized
+/// `vplzcntq` for u64 leading_zeros, no per-lane extraction. Available
+/// on Intel Ice Lake+ and AMD Zen 4+.
+#[target_feature(enable = "avx512f,avx512cd")]
+unsafe fn fill_iks_avx512(hashes: &[u64], p: u32, output: &mut Vec<(u32, u32)>) {
+    // SAFETY: target_feature enables AVX-512F + CD; the dispatcher
+    // confirms at runtime. All loads/stores operate on 64-byte slices
+    // and stack arrays we own.
+    unsafe {
+        let mask_p = (1u64 << p) - 1;
+        let mask_t = (1u64 << T) - 1;
+        let mask_pt = (1u64 << (p + T)) - 1;
+
+        let mask_p_v = _mm512_set1_epi64(mask_p as i64);
+        let mask_t_v = _mm512_set1_epi64(mask_t as i64);
+        let mask_pt_v = _mm512_set1_epi64(mask_pt as i64);
+        let one_v = _mm512_set1_epi64(1);
+
+        let chunks = hashes.chunks_exact(8);
+        let rem = chunks.remainder();
+        output.reserve(hashes.len());
+
+        for chunk in chunks {
+            let h_v = _mm512_loadu_si512(chunk.as_ptr() as *const __m512i);
+            let shifted = _mm512_srli_epi64(h_v, T);
+            let i_v = _mm512_and_si512(shifted, mask_p_v);
+            let a_v = _mm512_or_si512(h_v, mask_pt_v);
+            // Native 8-wide leading-zeros count — the whole point of
+            // the AVX-512 path.
+            let nlz_v = _mm512_lzcnt_epi64(a_v);
+            let low_t_v = _mm512_and_si512(h_v, mask_t_v);
+            let nlz_shl = _mm512_slli_epi64(nlz_v, T);
+            let nlz_plus = _mm512_add_epi64(nlz_shl, low_t_v);
+            let k_v = _mm512_add_epi64(nlz_plus, one_v);
+
+            let mut i_arr = [0u64; 8];
+            let mut k_arr = [0u64; 8];
+            _mm512_storeu_si512(i_arr.as_mut_ptr() as *mut __m512i, i_v);
+            _mm512_storeu_si512(k_arr.as_mut_ptr() as *mut __m512i, k_v);
+            for j in 0..8 {
+                output.push((i_arr[j] as u32, k_arr[j] as u32));
+            }
+        }
+
+        // Handle remainder via scalar path (chunk size 1..7).
+        for &h in rem {
+            let p_plus_t = p + T;
+            let i = ((h >> T) & ((1u64 << p) - 1)) as u32;
+            let a = h | ((1u64 << p_plus_t) - 1);
+            let nlz = a.leading_zeros() as u64;
+            let low_t = h & ((1u64 << T) - 1);
+            let k = ((nlz << T) + low_t + 1) as u32;
+            output.push((i, k));
+        }
+    }
+}
+
+/// Public entry point: dispatches to the best available SIMD path,
+/// falling through to the scalar [`crate::math::fill_iks`].
 pub(crate) fn fill_iks(hashes: &[u64], p: u32, output: &mut Vec<(u32, u32)>) {
-    if hashes.len() >= 4
+    if hashes.len() >= 8
+        && is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx512cd")
+    {
+        // SAFETY: feature detection confirms AVX-512F + CD.
+        unsafe { fill_iks_avx512(hashes, p, output) };
+    } else if hashes.len() >= 4
         && is_x86_feature_detected!("avx2")
         && is_x86_feature_detected!("bmi1")
         && is_x86_feature_detected!("lzcnt")
     {
-        // SAFETY: feature detection above confirms the target_feature
-        // set required by fill_iks_avx2. The function's body only uses
-        // those instructions.
+        // SAFETY: feature detection confirms AVX2 + BMI1 + LZCNT.
         unsafe { fill_iks_avx2(hashes, p, output) };
     } else {
         crate::math::fill_iks(hashes, p, output);
@@ -131,7 +192,7 @@ mod tests {
 
     #[test]
     fn simd_handles_partial_chunks() {
-        for n in [1usize, 2, 3, 4, 5, 7, 8, 9, 17] {
+        for n in [1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 23, 24, 25] {
             let hashes: Vec<u64> = (0..n as u64).map(splitmix64).collect();
             let mut scalar_out = Vec::new();
             crate::math::fill_iks(&hashes, 12, &mut scalar_out);

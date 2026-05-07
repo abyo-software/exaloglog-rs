@@ -6,6 +6,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-05-07
+
+### Added
+
+- **AVX-512 F + CD path** under the `simd` feature, used when both
+  `avx512f` and `avx512cd` are detected at runtime. Processes 8 hashes
+  per chunk and uses native `vplzcntq` (`_mm512_lzcnt_epi64`) for
+  vectorized 64-bit leading-zero counts — no per-lane scalar
+  extraction. Falls through to the AVX2 path otherwise. Available on
+  Intel Ice Lake+ and AMD Zen 4+.
+
+### Notes
+
+- After 0.10.0's counting sort, `fill_iks` is no longer the dominant
+  cost in `add_hashes_sorted` — the random-scatter phase of counting
+  sort and the per-register apply step are. AVX-512 still benefits
+  workloads where fill_iks is on the hot path (custom batch
+  pipelines), and lays groundwork for future vectorization of the
+  scatter and apply phases.
+
 ## [0.10.0] — 2026-05-07
 
 ### Changed
