@@ -58,7 +58,9 @@ sketches.
 ```rust
 use exaloglog::ExaLogLog;
 
-let mut sketch = ExaLogLog::new(12); // m = 2^12 = 4096 registers
+let mut sketch = ExaLogLog::new(12);          // m = 2^12 = 4096 registers
+// or, sized for a target accuracy:
+// let mut sketch = ExaLogLog::with_target_rmse(0.02);  // ~2% RMSE
 
 for i in 0..1_000_000u64 {
     sketch.add(&i);
@@ -68,10 +70,25 @@ let estimate = sketch.estimate();
 println!("estimated distinct: {estimate:.0}");
 ```
 
-For deserialization or post-merge sketches, `estimate()` falls back to the
-ML estimator (which works from register state alone). On a freshly built
-sketch, `estimate_martingale()` is also available and has slightly lower
-variance.
+`estimate()` defaults to the ML estimator (works after merges and from
+deserialized sketches). On a freshly built dense sketch, the martingale
+(HIP) estimator is also available via `estimate_martingale()` and has
+slightly lower variance.
+
+For high-throughput ingest, hash with a fast function and call
+`add_hash(u64)` directly:
+
+```rust,ignore
+use xxhash_rust::xxh3::xxh3_64;
+sketch.add_hash(xxh3_64(input));            // ~1.6× faster than add(&T)
+```
+
+Or batch-insert and let the crate handle cache locality:
+
+```rust,ignore
+let hashes: Vec<u64> = inputs.iter().map(|i| xxh3_64(i)).collect();
+sketch.add_hashes_sorted(&hashes);          // big win at p ≥ 14
+```
 
 ## Empirical accuracy
 
@@ -120,6 +137,17 @@ and `n ∈ {100, 1000, 10000}`. See `tests/java_parity.rs` and
 - `serde`: derives `Serialize` / `Deserialize` for both sketch types,
   going through the existing byte format. Works with bincode, JSON,
   MessagePack, CBOR, and any other serde data format.
+- `rayon`: enables `merge_many_par` and `merge_many_par_fast`, which
+  reduce a slice of sketches in parallel via Rayon's work-stealing
+  thread pool. Useful for rolling up many tenant sketches when you
+  have spare cores.
+- `simd`: enables an x86_64 AVX2 / AVX-512 batch path for the hash →
+  `(register index, update value)` computation used by
+  `add_hashes_sorted`. Unsafe `core::arch` calls are scoped to a
+  single module and gated by runtime feature detection. The rest of
+  the crate is `#![deny(unsafe_code)]`. Effectively raises the MSRV
+  to 1.89 (when AVX-512 intrinsics stabilized) when the feature is
+  enabled.
 
 ## License
 

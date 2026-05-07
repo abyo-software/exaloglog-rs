@@ -109,6 +109,18 @@ impl ExaLogLogFast {
         }
     }
 
+    /// Create a sketch sized so the theoretical RMSE at the eventual
+    /// cardinality is at most `target_rmse`. Same shape as
+    /// [`crate::ExaLogLog::with_target_rmse`] but with this variant's
+    /// MVP (3.78) and 32-bit registers.
+    pub fn with_target_rmse(target_rmse: f64) -> Self {
+        const MVP: f64 = 3.78;
+        const BITS_PER_REGISTER: f64 = 32.0;
+        let m_needed = MVP / (BITS_PER_REGISTER * target_rmse * target_rmse);
+        let p = (m_needed.log2().ceil() as i32).clamp(MIN_P as i32, MAX_P as i32) as u32;
+        Self::new(p)
+    }
+
     /// Create an empty sketch directly in dense mode (skips sparse).
     /// Use this if you know the cardinality will exceed the break-even
     /// point, or if you need atomic concurrent inserts immediately.

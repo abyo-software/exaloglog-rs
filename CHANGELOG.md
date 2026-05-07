@@ -6,6 +6,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-05-07
+
+### Added
+
+- **`with_target_rmse(target_rmse)` constructor** on both variants:
+  picks the smallest precision `p` whose theoretical RMSE is at most
+  `target_rmse`. Replaces the awkward "look up `p` in the docs" step
+  with a one-liner.
+
+  ```rust,ignore
+  let s = ExaLogLog::with_target_rmse(0.02);  // sized for ~2% accuracy
+  ```
+
+### Changed
+
+- README rewritten: usage section now shows the high-throughput insert
+  path (`add_hash` with xxh3) and the batch-insert path
+  (`add_hashes_sorted`) alongside the basic example. Optional-features
+  section enumerates `serde`, `rayon`, and `simd`.
+
 ## [0.12.0] — 2026-05-07
 
 ### Added

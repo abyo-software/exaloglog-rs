@@ -98,6 +98,25 @@ impl ExaLogLog {
         }
     }
 
+    /// Create a sketch sized so the theoretical RMSE at the eventual
+    /// cardinality is at most `target_rmse` (e.g., `0.02` for 2%).
+    /// Picks the smallest precision `p` that satisfies
+    /// `√(MVP / ((q + d) · 2^p)) ≤ target_rmse`, with `MVP = 3.67`,
+    /// `q + d = 28`. Clamped to `[MIN_P, MAX_P]`.
+    ///
+    /// ```
+    /// use exaloglog::ExaLogLog;
+    /// let s = ExaLogLog::with_target_rmse(0.02);  // ~2% target
+    /// assert!(s.precision() >= 7);                 // m=128, RMSE ≈ 1.0%
+    /// ```
+    pub fn with_target_rmse(target_rmse: f64) -> Self {
+        const MVP: f64 = 3.67;
+        const BITS_PER_REGISTER: f64 = 28.0;
+        let m_needed = MVP / (BITS_PER_REGISTER * target_rmse * target_rmse);
+        let p = (m_needed.log2().ceil() as i32).clamp(MIN_P as i32, MAX_P as i32) as u32;
+        Self::new(p)
+    }
+
     /// Create an empty sketch directly in dense mode (skips sparse).
     /// Useful when you know the cardinality will exceed the break-even
     /// point so the sparse-mode allocations are wasted.
@@ -937,6 +956,17 @@ mod tests {
             }
             assert!((serial.estimate_ml() - batched.estimate_ml()).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn with_target_rmse_picks_appropriate_p() {
+        let s_2pct = ExaLogLog::with_target_rmse(0.02);
+        // RMSE_target = 2%: m_needed = 3.67 / (28 * 0.02²) = 327.7 → p ≥ 9
+        assert!(s_2pct.precision() >= 8);
+        let s_1pct = ExaLogLog::with_target_rmse(0.01);
+        assert!(s_1pct.precision() > s_2pct.precision());
+        let s_0_5pct = ExaLogLog::with_target_rmse(0.005);
+        assert!(s_0_5pct.precision() > s_1pct.precision());
     }
 
     #[test]
