@@ -6,6 +6,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-05-07
+
+### Added
+
+- **`examples/paper_figure_8.rs`** reproduces the Figure 8 estimator
+  bias/RMSE table from the paper for the two configurations this
+  crate ships, `ELL(2, 20)` and `ELL(2, 24)`, across `p ∈ {4, 6, 8,
+  10}` and 11 cardinality checkpoints from 10 to 10⁶. Empirical RMSE
+  matches the theoretical `√(MVP / ((q + d) · m))` within the
+  statistical noise of 1,000 trials. Sample (`(t=2, d=24, p=10)`,
+  theoretical 1.074%):
+  - n = 1 k → ML 0.696%, HIP 0.671%
+  - n = 100 k → ML 1.023%, HIP 0.910%
+  - n = 1 M → ML 1.086%, HIP 0.959%
+
 ## [0.11.0] — 2026-05-07
 
 ### Added
