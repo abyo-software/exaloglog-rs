@@ -141,16 +141,19 @@ impl ExaLogLogFast {
     }
 
     /// Precision parameter.
+    #[must_use]
     pub fn precision(&self) -> u32 {
         self.p
     }
 
     /// Number of registers (`2^p`).
+    #[must_use]
     pub fn num_registers(&self) -> usize {
         1 << self.p
     }
 
     /// In-memory size of the storage in bytes.
+    #[must_use]
     pub fn register_bytes(&self) -> usize {
         match &self.storage {
             FastStorage::Sparse(v) => v.capacity() * 4,
@@ -159,6 +162,7 @@ impl ExaLogLogFast {
     }
 
     /// Returns `true` if the sketch is currently in sparse mode.
+    #[must_use]
     pub fn is_sparse(&self) -> bool {
         matches!(self.storage, FastStorage::Sparse(_))
     }
@@ -166,6 +170,7 @@ impl ExaLogLogFast {
     /// Snapshot of the current dense register values, materializing the
     /// sparse representation on the fly if needed. Always returns a
     /// fresh `Vec`.
+    #[must_use]
     pub fn snapshot(&self) -> Vec<u32> {
         match &self.storage {
             FastStorage::Dense(regs) => {
@@ -184,6 +189,7 @@ impl ExaLogLogFast {
     }
 
     /// `d` parameter (24).
+    #[must_use]
     pub fn d_parameter() -> u32 {
         D
     }
@@ -360,11 +366,13 @@ impl ExaLogLogFast {
     }
 
     /// Best available cardinality estimate (ML estimator).
+    #[must_use]
     pub fn estimate(&self) -> f64 {
         self.estimate_ml()
     }
 
     /// Maximum-likelihood estimate.
+    #[must_use]
     pub fn estimate_ml(&self) -> f64 {
         match &self.storage {
             FastStorage::Sparse(tokens) => math::estimate_from_tokens(tokens),
@@ -379,6 +387,7 @@ impl ExaLogLogFast {
     /// Martingale (HIP) estimate, if the running state is still valid.
     /// Returns `None` in sparse mode and after any merge, deserialization,
     /// or use of [`Self::add_hash_atomic`].
+    #[must_use]
     pub fn estimate_martingale(&self) -> Option<f64> {
         if self.martingale_invalid {
             None
@@ -556,6 +565,17 @@ impl ExaLogLogFast {
         out
     }
 
+    /// Returns `true` if the sketch has seen no inserts.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        match &self.storage {
+            FastStorage::Sparse(tokens) => tokens.is_empty(),
+            FastStorage::Dense(regs) => regs
+                .iter()
+                .all(|a| a.load(Ordering::Relaxed) == 0),
+        }
+    }
+
     /// Reset to empty (sparse).
     pub fn clear(&mut self) {
         self.storage = FastStorage::Sparse(Vec::new());
@@ -681,6 +701,26 @@ impl ExaLogLogFast {
             mu: f64::NAN,
             martingale_invalid: true,
         })
+    }
+}
+
+/// Two sketches compare equal iff they have the same precision and
+/// the same dense register state.
+impl PartialEq for ExaLogLogFast {
+    fn eq(&self, other: &Self) -> bool {
+        if self.p != other.p {
+            return false;
+        }
+        self.snapshot() == other.snapshot()
+    }
+}
+
+impl Eq for ExaLogLogFast {}
+
+impl Extend<u64> for ExaLogLogFast {
+    fn extend<I: IntoIterator<Item = u64>>(&mut self, iter: I) {
+        let hashes: Vec<u64> = iter.into_iter().collect();
+        self.add_hashes(&hashes);
     }
 }
 
@@ -988,6 +1028,47 @@ mod tests {
         }
         batched.add_hashes_atomic(&hashes);
         assert_eq!(serial.snapshot(), batched.snapshot());
+    }
+
+    #[test]
+    fn min_p_works() {
+        let mut s = ExaLogLogFast::new_dense(MIN_P);
+        for i in 0..1000u64 {
+            s.add_hash(splitmix64(i));
+        }
+        assert!(s.estimate_ml().is_finite());
+    }
+
+    #[test]
+    fn empty_sketch_is_empty() {
+        let s = ExaLogLogFast::new(12);
+        assert!(s.is_empty());
+        let s = ExaLogLogFast::new_dense(12);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn extend_matches_add_hashes() {
+        let p = 12;
+        let mut a = ExaLogLogFast::new_dense(p);
+        let mut b = ExaLogLogFast::new_dense(p);
+        let hashes: Vec<u64> = (0..50_000u64).map(splitmix64).collect();
+        a.add_hashes(&hashes);
+        b.extend(hashes.iter().copied());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn equality_and_send_sync() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<ExaLogLogFast>();
+        assert_sync::<ExaLogLogFast>();
+        let a = ExaLogLogFast::new(10);
+        let b = ExaLogLogFast::new(10);
+        assert_eq!(a, b);
+        let c = ExaLogLogFast::new(11);
+        assert_ne!(a, c);
     }
 
     #[test]

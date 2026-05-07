@@ -1,19 +1,37 @@
 //! ExaLogLog: space-efficient approximate distinct counting.
 //!
-//! Implementation of the ExaLogLog (ELL) algorithm by Otmar Ertl, "ExaLogLog:
-//! Space-Efficient and Practical Approximate Distinct Counting up to the
-//! Exa-Scale", arXiv:2402.13726 (2024).
+//! Implementation of the ExaLogLog (ELL) algorithm by Otmar Ertl,
+//! "ExaLogLog: Space-Efficient and Practical Approximate Distinct
+//! Counting up to the Exa-Scale", arXiv:2402.13726 / EDBT 2025.
 //!
-//! Compared to HyperLogLog with 6-bit registers, ExaLogLog achieves the same
-//! estimation error with **~43% less memory** (`ExaLogLog`, packed `d=20`)
-//! or **~41% less memory** with 32-bit aligned registers
-//! ([`ExaLogLogFast`], `d=24`) which are easier to access concurrently.
+//! Compared to HyperLogLog with 6-bit registers, ExaLogLog reaches the
+//! same estimation error with **~43% less in-memory state** (the
+//! [`ExaLogLog`] packed `d = 20` variant, MVP = 3.67) or **~41% less**
+//! with 32-bit aligned registers ([`ExaLogLogFast`], `d = 24`,
+//! MVP = 3.78) that are easier to access concurrently.
 //!
 //! Both variants:
+//!
 //! - support distinct counts up to the exa-scale (10¹⁹+);
 //! - are mergeable, idempotent, and reducible;
 //! - have constant-time inserts independent of `p`;
-//! - implement martingale (HIP) and maximum-likelihood estimators.
+//! - implement martingale (HIP) and maximum-likelihood estimators
+//!   (ML solver: paper Algorithm 8 with bisection fallback);
+//! - start in **sparse mode** (token list) and auto-promote to the
+//!   dense register array at the per-variant break-even point;
+//! - serialize through [`Self::to_bytes`] / [`Self::from_bytes`] with
+//!   wire-format version checking;
+//! - validate byte-for-byte against the Dynatrace Java reference
+//!   ([dynatrace-research/exaloglog-paper](https://github.com/dynatrace-research/exaloglog-paper))
+//!   in `tests/java_parity.rs`.
+//!
+//! # Choosing a variant
+//!
+//! - Use [`ExaLogLog`] (the packed default) for the smallest memory
+//!   footprint at a given accuracy. Single-threaded ingest only.
+//! - Use [`ExaLogLogFast`] when you need lock-free concurrent ingest
+//!   via [`ExaLogLogFast::add_hash_atomic`], or when you prefer
+//!   `u32`-aligned register access.
 //!
 //! # Example
 //!
@@ -27,6 +45,17 @@
 //! let estimate = sketch.estimate();
 //! assert!((estimate - 100_000.0).abs() / 100_000.0 < 0.05);
 //! ```
+//!
+//! # Optional features
+//!
+//! - `serde` — `Serialize` / `Deserialize` impls going through the
+//!   wire format. Works with bincode, JSON, MessagePack, CBOR, etc.
+//! - `rayon` — parallel rollups via [`merge_many_par`] /
+//!   [`merge_many_par_fast`].
+//! - `simd` — x86_64 SIMD batch path (AVX2 + BMI1 + LZCNT, with an
+//!   AVX-512 + CD upgrade when both are detected). Gated by runtime
+//!   feature detection. The `simd` feature effectively raises the
+//!   crate's MSRV to 1.89 (when AVX-512 intrinsics stabilized).
 
 #![warn(missing_docs)]
 #![deny(unsafe_code)]

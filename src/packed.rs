@@ -135,16 +135,19 @@ impl ExaLogLog {
     }
 
     /// Precision parameter.
+    #[must_use]
     pub fn precision(&self) -> u32 {
         self.p
     }
 
     /// Number of registers (`2^p`).
+    #[must_use]
     pub fn num_registers(&self) -> usize {
         1 << self.p
     }
 
     /// In-memory size of the storage in bytes.
+    #[must_use]
     pub fn register_bytes(&self) -> usize {
         match &self.storage {
             Storage::Sparse(tokens) => tokens.capacity() * 4,
@@ -153,11 +156,13 @@ impl ExaLogLog {
     }
 
     /// Returns `true` if the sketch is currently in sparse mode.
+    #[must_use]
     pub fn is_sparse(&self) -> bool {
         matches!(self.storage, Storage::Sparse(_))
     }
 
     /// `d` parameter (20).
+    #[must_use]
     pub fn d_parameter() -> u32 {
         D
     }
@@ -166,6 +171,7 @@ impl ExaLogLog {
     /// implicitly: we walk every token and apply Algorithm 2's rule on
     /// the fly. For repeated access prefer calling [`Self::densify`] once.
     #[inline]
+    #[must_use]
     pub fn get_register(&self, i: usize) -> u32 {
         debug_assert!(i < self.num_registers());
         match &self.storage {
@@ -377,11 +383,13 @@ impl ExaLogLog {
     /// token-based ML estimator (Algorithm 7); in dense mode it's the
     /// register-based ML estimator. Either way it works from the persistent
     /// state alone, so it is valid after merges and deserialization.
+    #[must_use]
     pub fn estimate(&self) -> f64 {
         self.estimate_ml()
     }
 
     /// Maximum-likelihood estimate.
+    #[must_use]
     pub fn estimate_ml(&self) -> f64 {
         match &self.storage {
             Storage::Sparse(tokens) => math::estimate_from_tokens(tokens),
@@ -395,6 +403,7 @@ impl ExaLogLog {
 
     /// Martingale (HIP) estimate, if the running state is still valid.
     /// Returns `None` in sparse mode and after any merge or deserialization.
+    #[must_use]
     pub fn estimate_martingale(&self) -> Option<f64> {
         if self.martingale_invalid {
             None
@@ -563,6 +572,17 @@ impl ExaLogLog {
         out
     }
 
+    /// Returns `true` if the sketch has seen no inserts. Cheap: in
+    /// sparse mode it's a `Vec::is_empty` check; in dense mode it
+    /// scans the storage for any non-zero byte.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        match &self.storage {
+            Storage::Sparse(tokens) => tokens.is_empty(),
+            Storage::Dense(s) => s.iter().all(|&b| b == 0),
+        }
+    }
+
     /// Reset to empty (sparse).
     pub fn clear(&mut self) {
         self.storage = Storage::Sparse(Vec::new());
@@ -683,6 +703,32 @@ impl ExaLogLog {
             mu: f64::NAN,
             martingale_invalid: true,
         })
+    }
+}
+
+/// Two sketches compare equal iff they have the same precision and
+/// produce the same dense register state. Both sides are densified
+/// internally for the comparison, so a sparse sketch and a dense
+/// sketch built from the same inputs compare equal.
+impl PartialEq for ExaLogLog {
+    fn eq(&self, other: &Self) -> bool {
+        if self.p != other.p {
+            return false;
+        }
+        let m = 1usize << self.p;
+        (0..m).all(|i| self.get_register(i) == other.get_register(i))
+    }
+}
+
+impl Eq for ExaLogLog {}
+
+/// `extend(iter_of_u64_hashes)` — convenience for streaming pre-hashed
+/// values. Sparse-mode aware: collects into a single bulk sort+dedup
+/// pass (`add_hashes`) rather than calling `add_hash` per element.
+impl Extend<u64> for ExaLogLog {
+    fn extend<I: IntoIterator<Item = u64>>(&mut self, iter: I) {
+        let hashes: Vec<u64> = iter.into_iter().collect();
+        self.add_hashes(&hashes);
     }
 }
 
@@ -1026,6 +1072,88 @@ mod tests {
         let est = s.estimate_ml();
         let rel_err = (est - 50.0).abs() / 50.0;
         assert!(rel_err < 0.20, "expected ~50, got {est}");
+    }
+
+    #[test]
+    fn min_p_works() {
+        let mut s = ExaLogLog::new_dense(MIN_P);
+        for i in 0..1000u64 {
+            s.add_hash(splitmix64(i));
+        }
+        assert!(s.estimate_ml().is_finite());
+    }
+
+    #[test]
+    fn max_p_works() {
+        // p=26 means m=64M registers, so dense is ~224 MB. Use sparse
+        // with a small n to keep the test cheap.
+        let mut s = ExaLogLog::new(MAX_P);
+        for i in 0..50u64 {
+            s.add_hash(splitmix64(i));
+        }
+        assert!(s.is_sparse());
+        let est = s.estimate_ml();
+        let rel = (est - 50.0).abs() / 50.0;
+        assert!(rel < 0.20, "MAX_P sparse estimate = {est}");
+    }
+
+    #[test]
+    fn empty_sketch_is_empty() {
+        let s = ExaLogLog::new(12);
+        assert!(s.is_empty());
+        let s = ExaLogLog::new_dense(12);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn populated_sketch_is_not_empty() {
+        let mut s = ExaLogLog::new(12);
+        s.add_hash(0xDEAD_BEEF);
+        assert!(!s.is_empty());
+        s.densify();
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn extend_matches_add_hashes() {
+        let p = 12;
+        let mut a = ExaLogLog::new_dense(p);
+        let mut b = ExaLogLog::new_dense(p);
+        let hashes: Vec<u64> = (0..50_000u64).map(splitmix64).collect();
+        a.add_hashes(&hashes);
+        b.extend(hashes.iter().copied());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn equality_matches_register_state() {
+        let p = 10;
+        let mut a = ExaLogLog::new(p);
+        let mut b = ExaLogLog::new_dense(p);
+        for i in 0..100u64 {
+            let h = splitmix64(i);
+            a.add_hash(h);
+            b.add_hash(h);
+        }
+        // a is sparse, b is dense; they should still compare equal.
+        assert!(a.is_sparse());
+        assert!(!b.is_sparse());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn different_p_compare_unequal() {
+        let a = ExaLogLog::new(10);
+        let b = ExaLogLog::new(11);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn is_send_and_sync() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<ExaLogLog>();
+        assert_sync::<ExaLogLog>();
     }
 
     #[test]

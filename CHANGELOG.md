@@ -6,6 +6,32 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-05-07
+
+### Added
+
+- **`is_empty()`** on both variants. Sparse-mode-aware: cheap
+  `Vec::is_empty` in sparse mode, byte/atomic scan in dense mode.
+- **`PartialEq` / `Eq`** for both variants. Two sketches compare equal
+  iff they have the same precision and produce the same dense register
+  state. Densification is implicit, so a sparse sketch and a dense one
+  built from the same inputs compare equal.
+- **`Extend<u64>`** for both variants. `sketch.extend(iter_of_hashes)`
+  is sugar for collecting and calling `add_hashes`.
+- **`#[must_use]`** on every public query (`estimate*`, `precision`,
+  `num_registers`, `register_bytes`, `is_empty`, `is_sparse`,
+  `get_register`, `snapshot`, `d_parameter`). Catches the common
+  "I forgot to use the result" bug at compile time.
+- **Crate-level documentation overview** with a "Choosing a variant"
+  paragraph and the optional-features list.
+- **Merge parity tests** against the Java reference: 8 new fixtures
+  covering `(d ∈ {20, 24}, p ∈ {8, 12}, n_each ∈ {100, 5000})`. Each
+  one checks that `merge(a, b)` in Rust produces the same registers
+  as `ExaLogLog.merge(a, b)` in Java.
+- Edge-case tests at `MIN_P = 3`, `MAX_P = 26`, empty sketches,
+  cross-mode equality, and `Send + Sync` compile-time assertions for
+  both variants.
+
 ## [0.13.0] — 2026-05-07
 
 ### Added
