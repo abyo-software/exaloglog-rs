@@ -6,6 +6,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-05-07
+
+### Changed
+
+- **Counting sort replaces `sort_unstable` in `add_hashes_sorted`.**
+  The register index is bounded `[0, m)`, so a single-pass count
+  + prefix-sum + scatter is `O(N + m)` versus the comparison sort's
+  `O(N log N)`. Net effect: at `p = 16, n = 10⁶` the sorted-batch
+  path goes from 32 → 51 M ins/s, **+89% over the scalar loop**
+  (which was 27 M/s at `p = 16` in the same bench). The crossover
+  point for sorted-vs-loop drops from `p ≈ 16` to `p ≈ 14`.
+
 ## [0.9.0] — 2026-05-07
 
 ### Added

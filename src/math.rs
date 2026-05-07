@@ -341,6 +341,34 @@ pub(crate) fn hash_to_register_k(hash: u64, p: u32) -> (usize, u32) {
     (i, k)
 }
 
+/// Counting sort `iks` by the register-index field. `m = 2^p` is the
+/// number of registers (max value `i` can take). Runs in `O(N + m)`
+/// time and uses `O(m + N)` auxiliary memory; meaningfully faster than
+/// `sort_unstable` for large batches when `m << N`.
+pub(crate) fn counting_sort_by_register(iks: &mut Vec<(u32, u32)>, m: usize) {
+    if iks.is_empty() {
+        return;
+    }
+    // Phase 1: count occurrences of each register index.
+    let mut counts = vec![0u32; m + 1];
+    for &(i, _) in iks.iter() {
+        counts[i as usize + 1] += 1;
+    }
+    // Phase 2: prefix sum so counts[i] becomes the start offset for i.
+    for w in 1..counts.len() {
+        counts[w] += counts[w - 1];
+    }
+    // Phase 3: scatter each tuple to its sorted position.
+    let mut out = vec![(0u32, 0u32); iks.len()];
+    let mut positions: Vec<u32> = counts[..m].to_vec();
+    for &(i, k) in iks.iter() {
+        let idx = positions[i as usize] as usize;
+        out[idx] = (i, k);
+        positions[i as usize] += 1;
+    }
+    *iks = out;
+}
+
 /// Fill `output` with `(i, k)` tuples for each input hash. Manually
 /// unrolled by 4 to give LLVM a clean shape for auto-vectorization on
 /// targets where `leading_zeros` is a single instruction (LZCNT on

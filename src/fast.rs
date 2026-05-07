@@ -321,7 +321,7 @@ impl ExaLogLogFast {
         crate::simd_x86::fill_iks(hashes, p, &mut iks);
         #[cfg(not(all(target_arch = "x86_64", feature = "simd")))]
         math::fill_iks(hashes, p, &mut iks);
-        iks.sort_unstable();
+        math::counting_sort_by_register(&mut iks, 1usize << p);
         let mut idx = 0;
         while idx < iks.len() {
             let i = iks[idx].0 as usize;
