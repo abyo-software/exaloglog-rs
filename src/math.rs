@@ -327,7 +327,7 @@ pub(crate) fn merge_register(r: u32, r2: u32, d: u32) -> u32 {
 }
 
 /// Compute (register_index, update_value `k`) from a 64-bit hash.
-#[inline]
+#[inline(always)]
 pub(crate) fn hash_to_register_k(hash: u64, p: u32) -> (usize, u32) {
     let p_plus_t = p + T;
     let i = ((hash >> T) & ((1u64 << p) - 1)) as usize;
@@ -339,6 +339,31 @@ pub(crate) fn hash_to_register_k(hash: u64, p: u32) -> (usize, u32) {
     debug_assert!(k >= 1);
     debug_assert!(k as u64 <= ((65 - p as u64 - T as u64) << T));
     (i, k)
+}
+
+/// Fill `output` with `(i, k)` tuples for each input hash. Manually
+/// unrolled by 4 to give LLVM a clean shape for auto-vectorization on
+/// targets where `leading_zeros` is a single instruction (LZCNT on
+/// x86_64 BMI1+, CLZ on aarch64).
+#[inline]
+pub(crate) fn fill_iks(hashes: &[u64], p: u32, output: &mut Vec<(u32, u32)>) {
+    output.reserve(hashes.len());
+    let chunks = hashes.chunks_exact(4);
+    let rem = chunks.remainder();
+    for chunk in chunks {
+        let (i0, k0) = hash_to_register_k(chunk[0], p);
+        let (i1, k1) = hash_to_register_k(chunk[1], p);
+        let (i2, k2) = hash_to_register_k(chunk[2], p);
+        let (i3, k3) = hash_to_register_k(chunk[3], p);
+        output.push((i0 as u32, k0));
+        output.push((i1 as u32, k1));
+        output.push((i2 as u32, k2));
+        output.push((i3 as u32, k3));
+    }
+    for &h in rem {
+        let (i, k) = hash_to_register_k(h, p);
+        output.push((i as u32, k));
+    }
 }
 
 /// Hash-token compression for sparse mode (Section 4.3, Eq. v + 6 bits).

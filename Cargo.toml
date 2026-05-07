@@ -1,6 +1,6 @@
 [package]
 name = "exaloglog"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["masumi-ryugo <abyo.software@gmail.com>"]
@@ -32,6 +32,11 @@ serde = ["dep:serde"]
 # Enables `merge_many_par` parallel reductions over slices of sketches,
 # powered by Rayon's work-stealing thread pool.
 rayon = ["dep:rayon"]
+# Enables x86_64 SIMD intrinsics in the batch-insert hot path. Unsafe
+# `core::arch::x86_64` calls are scoped to a single module and gated by
+# runtime feature detection (`is_x86_feature_detected!`) so the binary
+# remains portable. No effect on non-x86_64 targets.
+simd = []
 
 [dev-dependencies]
 serde_json = "1"

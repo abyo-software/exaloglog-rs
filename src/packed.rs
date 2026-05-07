@@ -322,13 +322,11 @@ impl ExaLogLog {
         }
         self.densify();
         let p = self.p;
-        let mut iks: Vec<(u32, u32)> = hashes
-            .iter()
-            .map(|&h| {
-                let (i, k) = math::hash_to_register_k(h, p);
-                (i as u32, k)
-            })
-            .collect();
+        let mut iks: Vec<(u32, u32)> = Vec::with_capacity(hashes.len());
+        #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+        crate::simd_x86::fill_iks(hashes, p, &mut iks);
+        #[cfg(not(all(target_arch = "x86_64", feature = "simd")))]
+        math::fill_iks(hashes, p, &mut iks);
         iks.sort_unstable();
         let mut idx = 0;
         while idx < iks.len() {

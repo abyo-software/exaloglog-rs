@@ -29,11 +29,14 @@
 //! ```
 
 #![warn(missing_docs)]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod fast;
 mod math;
 mod packed;
+#[cfg(all(target_arch = "x86_64", feature = "simd"))]
+#[allow(unsafe_code)]
+mod simd_x86;
 #[cfg(feature = "rayon")]
 mod rayon_impl;
 #[cfg(feature = "serde")]

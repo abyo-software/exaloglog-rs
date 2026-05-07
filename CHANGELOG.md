@@ -6,6 +6,31 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-05-07
+
+### Added
+
+- **Optional `simd` feature** that enables an x86_64 AVX2 + BMI1 +
+  LZCNT path for the batch hash → (register index, update value)
+  computation used by `add_hashes_sorted`. The unsafe `core::arch`
+  intrinsics are scoped to a single module and gated by runtime
+  feature detection (`is_x86_feature_detected!`); on non-x86_64
+  targets and on x86_64 CPUs missing the required ISA, the
+  scalar path runs unchanged. The crate body still uses
+  `#![deny(unsafe_code)]`; `simd_x86` is the only `unsafe` module
+  and only with the `simd` feature on.
+- Internal: `math::fill_iks` now batches the `(i, k)` computation
+  with manual 4-way unrolling, giving LLVM a clean shape for
+  auto-vectorization on aarch64 (CLZ).
+
+### Notes
+
+- On modern x86_64 (Ryzen 9 9950X, Ice Lake+) the scalar path already
+  compiles `leading_zeros` to LZCNT, so the `simd` feature shows
+  modest gains. Older CPUs that fall back to BSR see a larger win.
+  An AVX-512 `vplzcntq` path is on the roadmap for fully vectorized
+  lzcnt without per-lane extraction.
+
 ## [0.8.0] — 2026-05-07
 
 ### Added
