@@ -34,8 +34,13 @@
 mod fast;
 mod math;
 mod packed;
+#[cfg(feature = "rayon")]
+mod rayon_impl;
 #[cfg(feature = "serde")]
 mod serde_impl;
+
+#[cfg(feature = "rayon")]
+pub use rayon_impl::{merge_many_par, merge_many_par_fast};
 
 pub use fast::ExaLogLogFast;
 pub use packed::ExaLogLog;

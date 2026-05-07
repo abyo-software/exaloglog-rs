@@ -6,6 +6,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-05-07
+
+### Added
+
+- **Optional `rayon` feature** with `merge_many_par` and
+  `merge_many_par_fast` free functions: parallel reduce-merge over a
+  slice of sketches. Useful for rolling up many tenant sketches when
+  you have spare cores. 4 new tests verify parity with serial merge.
+- **`examples/fast_hashing.rs`**: side-by-side benchmark of the three
+  insert paths — `add(&T)` with `DefaultHasher` (SipHash13),
+  `add_hash(xxh3_64(bytes))`, and `add_hash(splitmix64)`. On byte
+  inputs `xxh3` is ~1.6× faster than the standard library default.
+
 ## [0.7.0] — 2026-05-07
 
 ### Added
