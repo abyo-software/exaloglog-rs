@@ -34,7 +34,7 @@
 //! resulting `u64`.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::math;
 use crate::{DeserializeError, FORMAT_VERSION, MAGIC, MergeError};
@@ -53,6 +53,11 @@ fn sparse_capacity(p: u32) -> usize {
     1usize << p
 }
 
+/// Same constraint as in [`crate::ExaLogLog`]: the 32-bit token format
+/// (`V = 26`, `T = 2`) is lossy for `p + t > V`, so we skip sparse mode
+/// for `p > 24` and start dense.
+const MAX_P_SPARSE: u32 = math::SPARSE_V - T;
+
 /// 32-bit aligned ExaLogLog with automatic sparse↔dense storage. See
 /// module docs.
 #[derive(Debug)]
@@ -62,6 +67,11 @@ pub struct ExaLogLogFast {
     martingale: f64,
     mu: f64,
     martingale_invalid: bool,
+    /// Set to `true` the first time [`Self::add_hash_atomic`] runs.
+    /// Read by [`Self::estimate_martingale`] alongside `martingale_invalid`
+    /// so concurrent atomic ingest correctly disables the HIP estimator
+    /// even though atomic insert can't take `&mut self`.
+    martingale_atomic_used: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -88,24 +98,33 @@ impl Clone for ExaLogLogFast {
             martingale: self.martingale,
             mu: self.mu,
             martingale_invalid: self.martingale_invalid,
+            martingale_atomic_used: AtomicBool::new(
+                self.martingale_atomic_used.load(Ordering::Relaxed),
+            ),
         }
     }
 }
 
 impl ExaLogLogFast {
-    /// Create an empty sketch starting in sparse mode. Auto-promotes to
-    /// dense at the break-even point.
+    /// Create an empty sketch starting in sparse mode (`p ≤ 24`) or
+    /// directly dense (`p > 24`, where the 32-bit token format would be
+    /// lossy). Auto-promotes from sparse to dense at the break-even
+    /// point.
     pub fn new(p: u32) -> Self {
         assert!(
             (MIN_P..=MAX_P).contains(&p),
             "precision p={p} out of range [{MIN_P}, {MAX_P}]"
         );
+        if p > MAX_P_SPARSE {
+            return Self::new_dense(p);
+        }
         Self {
             p,
             storage: FastStorage::Sparse(Vec::new()),
             martingale: 0.0,
             mu: 1.0,
             martingale_invalid: true, // sparse mode doesn't track HIP
+            martingale_atomic_used: AtomicBool::new(false),
         }
     }
 
@@ -113,7 +132,13 @@ impl ExaLogLogFast {
     /// cardinality is at most `target_rmse`. Same shape as
     /// [`crate::ExaLogLog::with_target_rmse`] but with this variant's
     /// MVP (3.78) and 32-bit registers.
+    ///
+    /// Panics if `target_rmse` is non-finite or non-positive.
     pub fn with_target_rmse(target_rmse: f64) -> Self {
+        assert!(
+            target_rmse.is_finite() && target_rmse > 0.0,
+            "with_target_rmse: target must be finite and positive, got {target_rmse}"
+        );
         const MVP: f64 = 3.78;
         const BITS_PER_REGISTER: f64 = 32.0;
         let m_needed = MVP / (BITS_PER_REGISTER * target_rmse * target_rmse);
@@ -137,6 +162,7 @@ impl ExaLogLogFast {
             martingale: 0.0,
             mu: 1.0,
             martingale_invalid: false,
+            martingale_atomic_used: AtomicBool::new(false),
         }
     }
 
@@ -269,6 +295,11 @@ impl ExaLogLogFast {
                 "add_hash_atomic requires dense mode; call .densify() or use new_dense()"
             ),
         };
+        // Mark martingale unavailable from any thread that observes this
+        // store. add_hash takes &mut self and sets `martingale_invalid`
+        // through the regular field; atomic insert can't, so we use this
+        // separate AtomicBool that estimate_martingale checks alongside.
+        self.martingale_atomic_used.store(true, Ordering::Relaxed);
         let (i, k) = math::hash_to_register_k(hash, self.p);
         let reg = &regs[i];
         let mut current = reg.load(Ordering::Relaxed);
@@ -389,7 +420,7 @@ impl ExaLogLogFast {
     /// or use of [`Self::add_hash_atomic`].
     #[must_use]
     pub fn estimate_martingale(&self) -> Option<f64> {
-        if self.martingale_invalid {
+        if self.martingale_invalid || self.martingale_atomic_used.load(Ordering::Relaxed) {
             None
         } else {
             Some(self.martingale)
@@ -492,7 +523,11 @@ impl ExaLogLogFast {
     }
 
     /// Reduce this sketch's precision to `new_p ≤ self.precision()`,
-    /// returning a new sketch (Algorithm 6, restricted to keeping `d`).
+    /// returning a new sketch following Algorithm 6 of the paper
+    /// (restricted to keeping `d` constant). The reduced sketch's ML
+    /// estimate matches a directly-built sketch at `new_p` to within
+    /// the property-test tolerance; exact byte-for-byte parity against
+    /// Java's `downsize` is not yet verified.
     pub fn reduce(&self, new_p: u32) -> Self {
         assert!(
             (MIN_P..=MAX_P).contains(&new_p) && new_p <= self.p,
@@ -675,6 +710,7 @@ impl ExaLogLogFast {
                 martingale: f64::NAN,
                 mu: f64::NAN,
                 martingale_invalid: true,
+                martingale_atomic_used: AtomicBool::new(false),
             });
         }
 
@@ -700,6 +736,7 @@ impl ExaLogLogFast {
             martingale: f64::NAN,
             mu: f64::NAN,
             martingale_invalid: true,
+            martingale_atomic_used: AtomicBool::new(false),
         })
     }
 }
@@ -921,6 +958,14 @@ mod tests {
             atomic.add_hash_atomic(h);
         }
         assert_eq!(serial.snapshot(), atomic.snapshot());
+    }
+
+    #[test]
+    fn atomic_insert_invalidates_martingale() {
+        // Regression: prior to v0.15 this returned Some(0.0).
+        let s = ExaLogLogFast::new_dense(10);
+        s.add_hash_atomic(0xDEAD_BEEF);
+        assert_eq!(s.estimate_martingale(), None);
     }
 
     #[test]

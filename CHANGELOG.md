@@ -6,6 +6,36 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-05-07
+
+Pre-launch correctness pass driven by an external review of the v0.14
+release.
+
+### Fixed
+
+- **Atomic ingest no longer leaks a stale martingale estimate.**
+  `ExaLogLogFast::add_hash_atomic` now sets a separate `AtomicBool`
+  flag so `estimate_martingale()` correctly returns `None` after any
+  atomic insert. Previously a sketch built only via `add_hash_atomic`
+  could return `Some(0.0)` from `estimate_martingale()`. The dense
+  scalar path is unchanged.
+- **Sparse mode is now disabled at construction for `p > 24`.** The
+  32-bit token format (V = 26, T = 2) loses information when
+  `p + t > V`, so the new constructors fall through to dense storage
+  in that regime. Behavior at `p ≤ 24` is unchanged.
+
+### Changed
+
+- `with_target_rmse` now panics on non-finite or non-positive input
+  rather than silently clamping. Real-input fast paths are unchanged.
+- `get_register(i)` panics on out-of-range `i` in both sparse and
+  dense modes (previously sparse silently returned 0, dense panicked
+  via slice indexing). Behavior is now consistent and explicit.
+- `reduce()` documentation softened from "identical" to "matches
+  within property-test tolerance" — exact byte-for-byte parity
+  against Java's `downsize` is on the v0.16 list. The implementation
+  is unchanged.
+
 ## [0.14.0] — 2026-05-07
 
 ### Added

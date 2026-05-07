@@ -49,9 +49,12 @@ less memory and *exact* distinct counts. Skip it with
 ### Reducing precision
 
 Both variants support `reduce(new_p)`, returning a sketch at lower
-precision identical to one that was built directly at `new_p`. Useful
-when you committed to too high a `p` and need to compact existing
-sketches.
+precision following Algorithm 6 of the paper (restricted to keeping
+`d` constant). The estimate from the reduced sketch matches a
+directly-built sketch at `new_p` to within a few percent on the
+property tests; an exact byte-for-byte parity test against the Java
+reference for `downsize` is on the v0.16 list. Useful when you
+committed to too high a `p` and need to compact existing sketches.
 
 ## Usage
 

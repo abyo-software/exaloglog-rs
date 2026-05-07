@@ -76,19 +76,30 @@ fn sparse_capacity(p: u32) -> usize {
     ((1usize << p) * 7) / 8
 }
 
+/// Maximum precision at which sparse mode is safe. Tokens are
+/// `V + 6 = 32` bits and reconstruct the original hash faithfully only
+/// when `p + t ≤ V`, i.e. `p ≤ V − T = 24`. For `p > 24` we skip sparse
+/// mode and start dense.
+const MAX_P_SPARSE: u32 = math::SPARSE_V - T;
+
 fn dense_storage_bytes(p: u32) -> usize {
     ((1usize << p) / 2) * BYTES_PER_PAIR
 }
 
 impl ExaLogLog {
     /// Create an empty sketch with `2^p` registers' worth of capacity.
-    /// The sketch starts in sparse mode and auto-promotes to dense when
-    /// the number of distinct elements exceeds `m · 7/8`.
+    /// The sketch starts in sparse mode (a sorted list of 32-bit hash
+    /// tokens) for `p ≤ 24` and auto-promotes to dense at the per-`p`
+    /// break-even point. For `p > 24` the 32-bit token format would be
+    /// lossy (`p + t > V`), so the sketch starts dense from the outset.
     pub fn new(p: u32) -> Self {
         assert!(
             (MIN_P..=MAX_P).contains(&p),
             "precision p={p} out of range [{MIN_P}, {MAX_P}]"
         );
+        if p > MAX_P_SPARSE {
+            return Self::new_dense(p);
+        }
         Self {
             p,
             storage: Storage::Sparse(Vec::new()),
@@ -104,12 +115,18 @@ impl ExaLogLog {
     /// `√(MVP / ((q + d) · 2^p)) ≤ target_rmse`, with `MVP = 3.67`,
     /// `q + d = 28`. Clamped to `[MIN_P, MAX_P]`.
     ///
+    /// Panics if `target_rmse` is non-finite or non-positive.
+    ///
     /// ```
     /// use exaloglog::ExaLogLog;
     /// let s = ExaLogLog::with_target_rmse(0.02);  // ~2% target
     /// assert!(s.precision() >= 7);                 // m=128, RMSE ≈ 1.0%
     /// ```
     pub fn with_target_rmse(target_rmse: f64) -> Self {
+        assert!(
+            target_rmse.is_finite() && target_rmse > 0.0,
+            "with_target_rmse: target must be finite and positive, got {target_rmse}"
+        );
         const MVP: f64 = 3.67;
         const BITS_PER_REGISTER: f64 = 28.0;
         let m_needed = MVP / (BITS_PER_REGISTER * target_rmse * target_rmse);
@@ -167,13 +184,22 @@ impl ExaLogLog {
         D
     }
 
-    /// Read register `i`. In sparse mode the dense array is materialized
-    /// implicitly: we walk every token and apply Algorithm 2's rule on
-    /// the fly. For repeated access prefer calling [`Self::densify`] once.
+    /// Read register `i`. Panics if `i ≥ self.num_registers()` (in
+    /// release builds the bounds check happens at the dense array
+    /// access; in sparse mode the panic is explicit so the modes
+    /// behave identically).
+    ///
+    /// In sparse mode the dense array is materialized implicitly: we
+    /// walk every token and apply Algorithm 2's rule on the fly. For
+    /// repeated access prefer calling [`Self::densify`] once.
     #[inline]
     #[must_use]
     pub fn get_register(&self, i: usize) -> u32 {
-        debug_assert!(i < self.num_registers());
+        assert!(
+            i < self.num_registers(),
+            "register index {i} out of range [0, {})",
+            self.num_registers()
+        );
         match &self.storage {
             Storage::Sparse(tokens) => {
                 let mut r = 0u32;
@@ -514,7 +540,12 @@ impl ExaLogLog {
     }
 
     /// Reduce this sketch's precision to `new_p ≤ self.precision()`,
-    /// returning a new sketch (Algorithm 6, restricted to keeping `d`).
+    /// returning a new sketch following Algorithm 6 of the paper
+    /// (restricted to keeping `d` constant). The reduced sketch's ML
+    /// estimate matches a directly-built sketch at `new_p` to within
+    /// the property-test tolerance (~10% rel-diff at `n = 50_000`).
+    /// An exact byte-for-byte parity test against Java's `downsize` is
+    /// open in the issue tracker.
     pub fn reduce(&self, new_p: u32) -> Self {
         assert!(
             (MIN_P..=MAX_P).contains(&new_p) && new_p <= self.p,
@@ -1084,17 +1115,20 @@ mod tests {
     }
 
     #[test]
-    fn max_p_works() {
-        // p=26 means m=64M registers, so dense is ~224 MB. Use sparse
-        // with a small n to keep the test cheap.
-        let mut s = ExaLogLog::new(MAX_P);
-        for i in 0..50u64 {
-            s.add_hash(splitmix64(i));
-        }
-        assert!(s.is_sparse());
-        let est = s.estimate_ml();
-        let rel = (est - 50.0).abs() / 50.0;
-        assert!(rel < 0.20, "MAX_P sparse estimate = {est}");
+    fn max_p_skips_sparse() {
+        // p > MAX_P_SPARSE = 24 → start dense. This is what we want
+        // because the 32-bit sparse-token format is lossy past p+t = V.
+        let s = ExaLogLog::new(25);
+        assert!(!s.is_sparse(), "p=25 should skip sparse mode");
+        let s = ExaLogLog::new(MAX_P);
+        assert!(!s.is_sparse(), "p=MAX_P should skip sparse mode");
+    }
+
+    #[test]
+    fn p_24_still_uses_sparse() {
+        // The boundary case: p=24 + t=2 = V=26, still safe.
+        let s = ExaLogLog::new(MAX_P_SPARSE);
+        assert!(s.is_sparse(), "p={MAX_P_SPARSE} should still be sparse");
     }
 
     #[test]
